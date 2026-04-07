@@ -67,34 +67,83 @@ def add_log(msg, level="info"):
 
 
 # ── Proxy Fetcher ──
-FREE_PROXY_SOURCES = [
-    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-]
-
-SOCKS5_SOURCES = [
-    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
-]
+PROXY_SOURCES = {
+    "http": [
+        # === GitHub raw lists (auto-updated) ===
+        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies.txt",
+        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/http.txt",
+        "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
+        "https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/main/http/raw/all.txt",
+        "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+        "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/main/proxies/http.txt",
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS.txt",
+        "https://raw.githubusercontent.com/shiftytr/proxy-list/master/proxy.txt",
+        # === API endpoints ===
+        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
+    ],
+    "socks4": [
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
+        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks4.txt",
+        "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks4.txt",
+        "https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/main/socks4/raw/all.txt",
+        "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks4.txt",
+        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4&timeout=10000&country=all",
+    ],
+    "socks5": [
+        "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks5.txt",
+        "https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/main/socks5/raw/all.txt",
+        "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks5.txt",
+        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all",
+    ],
+}
 
 
 def fetch_free_proxies(proxy_type="http"):
-    sources = FREE_PROXY_SOURCES if proxy_type == "http" else SOCKS5_SOURCES
+    sources = PROXY_SOURCES.get(proxy_type, PROXY_SOURCES["http"])
     proxies = set()
-    for url in sources:
+    fetch_lock = threading.Lock()
+    source_results = []
+
+    def _fetch_one(url):
         try:
             resp = requests.get(url, timeout=15)
             if resp.status_code == 200:
-                lines = resp.text.strip().split("\n")
-                for line in lines:
+                found = set()
+                for line in resp.text.strip().split("\n"):
                     line = line.strip()
-                    if line and ":" in line:
-                        proxies.add(line)
-        except Exception as e:
-            add_log(f"프록시 소스 실패: {url} | {e}", "warn")
-    add_log(f"무료 {proxy_type} 프록시 {len(proxies)}개 수집 완료")
+                    if line and ":" in line and not line.startswith("#"):
+                        # Strip protocol prefix if present
+                        clean = strip_proxy_prefix(line)
+                        if clean and ":" in clean:
+                            found.add(clean)
+                with fetch_lock:
+                    proxies.update(found)
+                    source_results.append((url.split("/")[-2] if "github" in url else url.split("/")[2], len(found)))
+        except Exception:
+            pass
+
+    # Fetch all sources in parallel
+    threads = []
+    for url in sources:
+        t = threading.Thread(target=_fetch_one, args=(url,), daemon=True)
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join(timeout=20)
+
+    # Log results
+    for src, cnt in sorted(source_results, key=lambda x: -x[1]):
+        add_log(f"  {src}: {cnt}개", "info")
+    add_log(f"무료 {proxy_type} 프록시 {len(proxies)}개 수집 완료 ({len(source_results)}/{len(sources)} 소스)")
     return list(proxies)
 
 
@@ -125,23 +174,6 @@ def check_proxy_youtube(proxy, proxy_type="http", timeout=8):
         return False
 
 
-def check_proxy(proxy, proxy_type="http", timeout=5):
-    """Quick check via ip-api (used as first filter)."""
-    try:
-        clean = strip_proxy_prefix(proxy)
-        proxy_dict = {
-            "http": f"{proxy_type}://{clean}",
-            "https": f"{proxy_type}://{clean}",
-        }
-        resp = requests.get(
-            "http://ip-api.com/json?fields=status",
-            proxies=proxy_dict,
-            timeout=timeout,
-        )
-        return resp.status_code == 200
-    except Exception:
-        return False
-
 
 # Shared bad proxy set to avoid reuse across batches
 _bad_proxy_set = set()
@@ -158,82 +190,62 @@ def is_bad_proxy(proxy):
         return strip_proxy_prefix(proxy) in _bad_proxy_set
 
 
-def pre_validate_proxies(proxy_list, proxy_type="http", max_workers=40, target=30):
-    """Two-stage validation: quick ip-api check, then YouTube reachability."""
+def pre_validate_proxies(proxy_list, proxy_type="http", max_workers=150, target=30):
+    """Direct YouTube reachability validation with high concurrency.
+    Prioritizes accuracy over speed — tests proxies directly against YouTube."""
     import random
-    stage1_valid = []
     final_valid = []
     lock = threading.Lock()
     done_event = threading.Event()
 
-    add_log(f"프록시 검증 시작 (후보 {len(proxy_list)}개, 목표 {target}개)...")
+    # ~1% pass rate observed, so sample target * 150 to be safe
+    needed_samples = min(len(proxy_list), max(target * 150, 3000))
+    sample = random.sample(proxy_list, needed_samples)
 
-    sample = random.sample(proxy_list, min(400, len(proxy_list)))
+    add_log(f"프록시 검증 시작 (후보 {len(proxy_list)}개, 테스트 {len(sample)}개, 목표 {target}개)...")
+    add_log(f"YouTube 직접 검증 (동시 {max_workers} 스레드)...")
 
-    # Stage 1: Quick ip-api check
-    def _quick_check(proxy):
-        if done_event.is_set() or cancel_flag.is_set():
-            return
-        if check_proxy(proxy, proxy_type, 5):
-            with lock:
-                stage1_valid.append(proxy)
-                if len(stage1_valid) >= target * 3:
-                    done_event.set()
-
-    threads_list = []
-    for p in sample:
-        if done_event.is_set():
-            break
-        t = threading.Thread(target=_quick_check, args=(p,), daemon=True)
-        threads_list.append(t)
-        t.start()
-        while sum(1 for t in threads_list if t.is_alive()) >= max_workers:
-            sleep(0.1)
-
-    deadline = time.time() + 20
-    for t in threads_list:
-        remaining = max(0, deadline - time.time())
-        t.join(timeout=remaining)
-        if time.time() >= deadline or done_event.is_set():
-            break
-
-    add_log(f"Stage 1 (ip-api): {len(stage1_valid)}개 통과")
-
-    if not stage1_valid:
-        add_log("Stage 1 통과 프록시 없음", "error")
-        return []
-
-    # Stage 2: YouTube reachability check
-    done_event.clear()
-    threads_list = []
+    tested = [0]  # mutable counter
 
     def _yt_check(proxy):
         if done_event.is_set() or cancel_flag.is_set():
             return
-        if check_proxy_youtube(proxy, proxy_type, 8):
+        if check_proxy_youtube(proxy, proxy_type, 12):
             with lock:
                 final_valid.append(proxy)
-                add_log(f"  YouTube OK: {strip_proxy_prefix(proxy)}", "success")
+                add_log(f"  YouTube OK: {strip_proxy_prefix(proxy)} [{len(final_valid)}/{target}]", "success")
                 if len(final_valid) >= target:
                     done_event.set()
+        with lock:
+            tested[0] += 1
+            # Progress update every 500 proxies
+            if tested[0] % 500 == 0:
+                add_log(f"  검증 진행: {tested[0]}/{len(sample)} 테스트, {len(final_valid)}개 유효")
 
-    for p in stage1_valid:
-        if done_event.is_set():
+    threads_list = []
+    for p in sample:
+        if done_event.is_set() or cancel_flag.is_set():
             break
         t = threading.Thread(target=_yt_check, args=(p,), daemon=True)
         threads_list.append(t)
         t.start()
         while sum(1 for t in threads_list if t.is_alive()) >= max_workers:
-            sleep(0.1)
+            sleep(0.01)
 
-    deadline = time.time() + 30
+    # Allow enough time: 12s timeout * 2 buffer
+    deadline = time.time() + 180
     for t in threads_list:
+        if done_event.is_set():
+            break
         remaining = max(0, deadline - time.time())
         t.join(timeout=remaining)
-        if time.time() >= deadline or done_event.is_set():
+        if time.time() >= deadline:
             break
 
-    add_log(f"Stage 2 (YouTube): {len(final_valid)}개 유효", "success" if final_valid else "error")
+    add_log(
+        f"검증 완료: {len(final_valid)}개 YouTube 유효 프록시 (테스트 {tested[0]}/{len(sample)})",
+        "success" if final_valid else "error",
+    )
     return final_valid
 
 
