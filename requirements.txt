@@ -1,10 +1,5 @@
 flask>=2.0
 requests>=2.28
-selenium>=4.8
-undetected-chromedriver>=3.2
-fake-headers>=1.0
-faker>=16.0
+nodriver>=0.38
 psutil>=5.9
-beautifulsoup4>=4.11
 PySocks>=1.7
-tabulate>=0.9

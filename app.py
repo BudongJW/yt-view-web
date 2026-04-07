@@ -1,37 +1,26 @@
 """
 YouTube View Web — 웹 대시보드 기반 YouTube 뷰어 봇
-MShawon/YouTube-Viewer 핵심 로직 활용 + Flask 웹 UI
+nodriver (CDP) 기반 — chromedriver 불필요, RAM 대폭 절감
 """
+import asyncio
+import io
 import json
 import os
-import shutil
+import sys
 import threading
 import time
 from datetime import datetime
-from random import choice, choices, randint, uniform
+from random import choice, randint, uniform
 from time import gmtime, sleep, strftime
 
-import psutil
+import nodriver as uc
 import requests
-from fake_headers import Headers
-from faker import Faker
 from flask import Flask, jsonify, render_template, request
-from requests.exceptions import RequestException
-from selenium import webdriver
-from selenium.common.exceptions import WebDriverException
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
 
-try:
-    from undetected_chromedriver.patcher import Patcher
-    HAS_PATCHER = True
-except ImportError:
-    HAS_PATCHER = False
-
-fake = Faker()
+# Fix Windows cp949 encoding crash (emoji/unicode in nodriver output)
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 # ── Global State ──
 bot_state = {
@@ -249,191 +238,129 @@ def pre_validate_proxies(proxy_list, proxy_type="http", max_workers=150, target=
     return final_valid
 
 
-# ── Chrome Driver ──
+# ── nodriver (CDP) Browser ──
 VIEWPORTS = [
-    "2560,1440", "1920,1080", "1440,900",
-    "1536,864", "1366,768", "1280,1024", "1024,768",
+    (2560, 1440), (1920, 1080), (1440, 900),
+    (1536, 864), (1366, 768), (1280, 1024), (1024, 768),
 ]
-
-REFERERS = [
-    "https://www.google.com/",
-    "https://search.yahoo.com/",
-    "https://duckduckgo.com/",
-    "https://www.bing.com/",
-    "https://t.co/",
-    "",
-]
-
 
 CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.178 Safari/537.36"
 
 
-def get_driver(background, agent, proxy=None, proxy_type="http"):
-    options = webdriver.ChromeOptions()
-    if background:
-        options.add_argument("--headless=new")
-    options.add_argument(f"--window-size={choice(VIEWPORTS)}")
-    options.add_argument("--log-level=3")
-    options.add_experimental_option(
-        "excludeSwitches", ["enable-automation", "enable-logging"]
-    )
-    options.add_experimental_option("useAutomationExtension", False)
-    prefs = {
-        "intl.accept_languages": "en_US,en",
-        "credentials_enable_service": False,
-        "profile.password_manager_enabled": False,
-        "profile.default_content_setting_values.notifications": 2,
-        "download_restrictions": 3,
-    }
-    options.add_experimental_option("prefs", prefs)
-    # Use current Chrome version UA to avoid YouTube supported_browsers redirect
-    options.add_argument(f"user-agent={CHROME_UA}")
-    options.add_argument("--mute-audio")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-features=UserAgentClientHint")
-    options.add_argument("--disable-web-security")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-
+async def start_browser(headless=True, proxy=None, proxy_type="http"):
+    """Start a nodriver browser with optimized flags. No chromedriver needed."""
+    vp = choice(VIEWPORTS)
+    args = [
+        f"--window-size={vp[0]},{vp[1]}",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-extensions",
+        "--mute-audio",
+        "--disable-features=UserAgentClientHint",
+        "--blink-settings=imagesEnabled=false",
+        "--js-flags=--max-old-space-size=128",
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--disable-backgrounding-occluded-windows",
+        f"--user-agent={CHROME_UA}",
+    ]
     if proxy:
-        options.add_argument(f"--proxy-server={proxy_type}://{proxy}")
+        args.append(f"--proxy-server={proxy_type}://{proxy}")
 
-    driver = webdriver.Chrome(options=options)
-    return driver
-
-
-def bypass_consent(driver):
-    try:
-        btns = driver.find_elements(
-            By.CSS_SELECTOR, 'button[aria-label*="Accept"], button[aria-label*="agree"], #yDmH0d button'
-        )
-        for btn in btns:
-            try:
-                btn.click()
-                sleep(1)
-                return
-            except Exception:
-                continue
-        # form submit fallback
-        forms = driver.find_elements(By.CSS_SELECTOR, "form")
-        for form in forms:
-            try:
-                form.submit()
-                sleep(1)
-                return
-            except Exception:
-                continue
-    except Exception:
-        pass
+    browser = await uc.start(headless=headless, browser_args=args)
+    return browser
 
 
-def play_video(driver):
-    try:
-        driver.find_element(By.CSS_SELECTOR, '[title^="Pause (k)"]')
-    except WebDriverException:
-        try:
-            driver.find_element(
-                By.CSS_SELECTOR, "button.ytp-large-play-button.ytp-button"
-            ).send_keys(Keys.ENTER)
-        except WebDriverException:
-            try:
-                driver.find_element(
-                    By.CSS_SELECTOR, '[title^="Play (k)"]'
-                ).click()
-            except WebDriverException:
-                try:
-                    driver.execute_script(
-                        "document.querySelector('button.ytp-play-button.ytp-button').click()"
-                    )
-                except WebDriverException:
-                    pass
-
-
-def save_bandwidth(driver):
-    try:
-        driver.find_element(By.CSS_SELECTOR, "button.ytp-settings-button").click()
-        sleep(0.5)
-        items = driver.find_elements(By.CSS_SELECTOR, ".ytp-menuitem")
-        for item in items:
-            if "Quality" in item.text or "화질" in item.text:
-                item.click()
-                sleep(0.5)
-                qualities = driver.find_elements(By.CSS_SELECTOR, ".ytp-menuitem")
-                if qualities:
-                    qualities[-1].click()  # lowest quality
-                break
-    except Exception:
-        pass
-
-
-# ── Main Worker ──
-def _try_load_video(driver, config, position, proxy_label):
+async def _try_load_video_async(page, browser, config, position, proxy_label):
     """Navigate to YouTube video and wait for player. Returns True on success."""
     url = config["url"]
 
-    driver.get(url)
-    sleep(4)
+    page = await browser.get(url)
+    await page.sleep(4)
 
     # Handle supported_browsers redirect
-    if "supported_browsers" in driver.current_url:
+    cur_url = page.url or ""
+    if "supported_browsers" in cur_url:
         add_log(f"Worker {position} | supported_browsers redirect - retrying", "warn")
-        driver.get(url)
-        sleep(4)
+        page = await browser.get(url)
+        await page.sleep(4)
+        cur_url = page.url or ""
 
-    # Bypass consent if redirected
-    if "consent" in driver.current_url:
-        bypass_consent(driver)
-        sleep(2)
-        if "consent" in driver.current_url:
-            driver.get(url)
-            sleep(4)
+    # Handle consent redirect
+    if "consent" in cur_url:
+        # Try clicking accept button via JS
+        await page.evaluate('''
+            (() => {
+                const btns = document.querySelectorAll('button[aria-label*="Accept"], button[aria-label*="agree"], #yDmH0d button');
+                if (btns.length > 0) btns[0].click();
+                else { const forms = document.querySelectorAll('form'); if (forms.length > 0) forms[0].submit(); }
+            })()
+        ''')
+        await page.sleep(3)
+        cur_url = page.url or ""
+        if "consent" in cur_url:
+            page = await browser.get(url)
+            await page.sleep(4)
 
-    # Wait for player
-    try:
-        WebDriverWait(driver, 40).until(
-            EC.presence_of_element_located((By.ID, "movie_player"))
-        )
-        sleep(3)
-        return True
-    except Exception:
-        cur_url = driver.current_url
-        if "supported_browsers" in cur_url:
-            add_log(f"Worker {position} | {proxy_label} | YouTube blocked (unsupported browser)", "warn")
-        else:
-            add_log(f"Worker {position} | {proxy_label} | Player load failed | url={cur_url[:80]}", "warn")
-        return False
+    # Wait for player (poll up to 40s)
+    for _ in range(20):
+        has_player = await page.evaluate('!!document.getElementById("movie_player")')
+        if has_player:
+            await page.sleep(3)
+            return page
+        await page.sleep(2)
+
+    cur_url = page.url or ""
+    if "supported_browsers" in cur_url:
+        add_log(f"Worker {position} | {proxy_label} | YouTube blocked (unsupported browser)", "warn")
+    else:
+        add_log(f"Worker {position} | {proxy_label} | Player load failed | url={cur_url[:80]}", "warn")
+    return None
 
 
-def _watch_video(driver, config, position, proxy_label):
-    """Play and watch the video. Returns True if view was counted."""
-    # Save bandwidth
+async def _watch_video_async(page, config, position, proxy_label):
+    """Play and watch the video via CDP. Returns True if view was counted."""
+    # Set lowest quality via JS
     if config.get("save_bandwidth", True):
-        save_bandwidth(driver)
+        await page.evaluate('''
+            (() => {
+                try {
+                    const p = document.getElementById('movie_player');
+                    if (p && p.setPlaybackQualityRange) p.setPlaybackQualityRange('tiny', 'tiny');
+                    else if (p && p.setPlaybackQuality) p.setPlaybackQuality('tiny');
+                } catch(e) {}
+            })()
+        ''')
 
-    play_video(driver)
+    # Play video
+    await page.evaluate('''
+        (() => {
+            const p = document.getElementById('movie_player');
+            if (p && p.playVideo) p.playVideo();
+        })()
+    ''')
 
     # Change playback speed
     speed = config.get("playback_speed", 1)
     if speed != 1:
-        try:
-            driver.execute_script(f"document.querySelector('video').playbackRate = {speed};")
-        except Exception:
-            pass
+        await page.evaluate(f"try {{ document.querySelector('video').playbackRate = {speed}; }} catch(e) {{}}")
 
-    # Get video duration
+    # Get video duration (retry up to 20 times)
     video_len = 0
     for _ in range(20):
-        video_len = driver.execute_script(
-            "return document.getElementById('movie_player').getDuration()"
+        video_len = await page.evaluate(
+            "(() => { try { return document.getElementById('movie_player').getDuration(); } catch(e) { return 0; } })()"
         )
         if video_len:
             break
-        sleep(1)
+        await page.sleep(1)
 
     if not video_len:
         raise Exception("Cannot get video duration")
 
-    title = driver.title.replace(" - YouTube", "")
+    raw_title = await page.evaluate("document.title")
+    title = (raw_title or "").replace(" - YouTube", "")
     min_pct = config.get("min_duration", 70) / 100
     max_pct = config.get("max_duration", 95) / 100
     watch_time = video_len * uniform(min_pct, max_pct)
@@ -442,11 +369,11 @@ def _watch_video(driver, config, position, proxy_label):
     bot_state["workers"][position] = {
         "proxy": proxy_label,
         "status": "watching",
-        "title": title,
+        "title": title[:60],
         "duration": duration_str,
     }
 
-    add_log(f"Worker {position} | {proxy_label} | {title} | {duration_str}")
+    add_log(f"Worker {position} | {proxy_label} | {title[:50]} | {duration_str}")
 
     # Watch loop
     error_streak = 0
@@ -454,18 +381,29 @@ def _watch_video(driver, config, position, proxy_label):
     for _ in range(loop_count):
         if cancel_flag.is_set():
             break
-        sleep(5)
+        await page.sleep(5)
         try:
-            current_time = driver.execute_script(
-                "return document.getElementById('movie_player').getCurrentTime()"
-            )
-            state = driver.execute_script(
-                "return document.getElementById('movie_player').getPlayerState()"
-            )
+            result = await page.evaluate('''
+                (() => {
+                    try {
+                        const p = document.getElementById('movie_player');
+                        return {t: p.getCurrentTime(), s: p.getPlayerState()};
+                    } catch(e) { return null; }
+                })()
+            ''')
+            if not result:
+                error_streak += 1
+                if error_streak > 4:
+                    raise Exception("Player communication lost")
+                continue
+
+            state = result.get("s", -99)
+            current_time = result.get("t", 0)
+
             if state in [-1, 0]:  # unstarted or ended
                 break
             if state == 2:  # paused
-                play_video(driver)
+                await page.evaluate("try { document.getElementById('movie_player').playVideo(); } catch(e) {}")
             if state == 3:  # buffering
                 error_streak += 1
                 if error_streak > 6:
@@ -474,7 +412,9 @@ def _watch_video(driver, config, position, proxy_label):
                 error_streak = 0
             if current_time >= watch_time:
                 break
-        except WebDriverException:
+        except Exception as e:
+            if "communication lost" in str(e) or "Buffering" in str(e):
+                raise
             error_streak += 1
             if error_streak > 4:
                 raise Exception("Player communication lost")
@@ -487,97 +427,8 @@ def _watch_video(driver, config, position, proxy_label):
     return True
 
 
-def worker_view(position, proxy, proxy_type, config):
-    """Worker with retry logic: tries up to MAX_RETRIES different proxies on failure."""
-    if cancel_flag.is_set():
-        return
-
-    is_direct = (proxy == "__direct__")
-    max_retries = 1 if is_direct else config.get("_max_retries", 3)
-    proxy_pool = config.get("_proxy_pool", [proxy])
-
-    for attempt in range(max_retries):
-        if cancel_flag.is_set():
-            return
-
-        # Pick proxy (rotate on retry)
-        if attempt > 0 and not is_direct:
-            available = [p for p in proxy_pool if not is_bad_proxy(p)]
-            if not available:
-                add_log(f"Worker {position} | No more proxies to try", "error")
-                break
-            proxy = choice(available)
-
-        clean_proxy = proxy if is_direct else strip_proxy_prefix(proxy)
-        proxy_label = "Direct" if is_direct else clean_proxy
-
-        driver = None
-        try:
-            if not is_direct and is_bad_proxy(proxy):
-                continue
-
-            bot_state["good_proxies"] += 1
-            retry_tag = f" (retry {attempt})" if attempt > 0 else ""
-            add_log(f"Worker {position} | {proxy_label}{retry_tag} | Starting driver")
-
-            background = config.get("headless", True)
-            driver = get_driver(background, None, None if is_direct else clean_proxy, proxy_type)
-
-            bot_state["workers"][position] = {"proxy": proxy_label, "status": "loading"}
-
-            # Spoof timezone (skip on retry to save time)
-            if attempt == 0:
-                try:
-                    if is_direct:
-                        geo = requests.get("http://ip-api.com/json", timeout=8).json()
-                    else:
-                        pdict = {"http": f"{proxy_type}://{clean_proxy}", "https": f"{proxy_type}://{clean_proxy}"}
-                        geo = requests.get("http://ip-api.com/json", proxies=pdict, timeout=8).json()
-                    driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": geo.get("timezone", "UTC")})
-                    driver.execute_cdp_cmd("Emulation.setGeolocationOverride", {
-                        "latitude": geo.get("lat", 0),
-                        "longitude": geo.get("lon", 0),
-                        "accuracy": randint(20, 100),
-                    })
-                except Exception:
-                    pass
-
-            # Try loading video
-            if not _try_load_video(driver, config, position, proxy_label):
-                if not is_direct:
-                    mark_bad_proxy(proxy)
-                    bot_state["bad_proxies"] += 1
-                raise Exception("Video load failed")
-
-            # Watch video
-            _watch_video(driver, config, position, proxy_label)
-            return  # Success, exit retry loop
-
-        except Exception as e:
-            err_msg = str(e)
-            if len(err_msg) > 150:
-                err_msg = err_msg[:150] + "..."
-            if attempt == max_retries - 1:
-                bot_state["errors"] += 1
-                add_log(f"Worker {position} | FAIL after {attempt+1} tries: {err_msg}", "error")
-            else:
-                add_log(f"Worker {position} | Retry {attempt+1}: {err_msg}", "warn")
-        finally:
-            bot_state["workers"].pop(position, None)
-            if driver:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-
-
-def worker_multitab(position, proxy, proxy_type, config):
-    """Efficient worker: opens ONE Chrome and cycles multiple views via new tabs.
-    Includes proxy retry on first-tab failure (up to 3 proxies).
-    Dramatically reduces RAM usage (~75MB per tab vs ~500MB per Chrome instance)."""
-    if cancel_flag.is_set():
-        return
-
+async def _worker_multitab_async(position, proxy, proxy_type, config):
+    """Async multitab worker using nodriver (CDP). One Chrome, multiple views."""
     is_direct = (proxy == "__direct__")
     proxy_pool = config.get("_proxy_pool", [proxy])
     max_retries = 1 if is_direct else 3
@@ -600,42 +451,30 @@ def worker_multitab(position, proxy, proxy_type, config):
         if not is_direct and is_bad_proxy(proxy):
             continue
 
-        driver = None
+        browser = None
         try:
             bot_state["good_proxies"] += 1
             retry_tag = f" (retry {attempt})" if attempt > 0 else ""
-            add_log(f"Worker {position} | {proxy_label}{retry_tag} | Starting (multitab x{views_per_session})")
+            add_log(f"Worker {position} | {proxy_label}{retry_tag} | Starting (nodriver x{views_per_session})")
 
-            background = config.get("headless", True)
-            driver = get_driver(background, None, None if is_direct else clean_proxy, proxy_type)
-
-            # Spoof timezone once for the session
-            try:
-                if is_direct:
-                    geo = requests.get("http://ip-api.com/json", timeout=8).json()
-                else:
-                    pdict = {"http": f"{proxy_type}://{clean_proxy}", "https": f"{proxy_type}://{clean_proxy}"}
-                    geo = requests.get("http://ip-api.com/json", proxies=pdict, timeout=8).json()
-                driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": geo.get("timezone", "UTC")})
-                driver.execute_cdp_cmd("Emulation.setGeolocationOverride", {
-                    "latitude": geo.get("lat", 0),
-                    "longitude": geo.get("lon", 0),
-                    "accuracy": randint(20, 100),
-                })
-            except Exception:
-                pass
+            headless = config.get("headless", True)
+            browser = await start_browser(headless, None if is_direct else clean_proxy, proxy_type)
 
             bot_state["workers"][position] = {"proxy": proxy_label, "status": "loading"}
 
+            # Get initial page
+            page = await browser.get("about:blank")
+
             # First tab: if this fails, retry with different proxy
-            if not _try_load_video(driver, config, position, proxy_label):
+            page = await _try_load_video_async(page, browser, config, position, proxy_label)
+            if not page:
                 if not is_direct:
                     mark_bad_proxy(proxy)
                     bot_state["bad_proxies"] += 1
                 raise Exception("Video load failed")
 
             # First tab succeeded - watch it
-            _watch_video(driver, config, position, proxy_label)
+            await _watch_video_async(page, config, position, proxy_label)
             session_views = 1
 
             # Continue with more tabs in the same Chrome
@@ -646,38 +485,36 @@ def worker_multitab(position, proxy, proxy_type, config):
                 bot_state["workers"][position] = {"proxy": proxy_label, "status": f"tab {tab_i+1}/{views_per_session}"}
 
                 try:
-                    # Open new tab
-                    driver.execute_script("window.open('', '_blank');")
-                    driver.switch_to.window(driver.window_handles[-1])
+                    # Open new tab via browser.get with new_tab=True
+                    new_page = await browser.get(config["url"], new_tab=True)
+                    await new_page.sleep(4)
 
-                    if not _try_load_video(driver, config, position, proxy_label):
+                    # Check player on new tab
+                    loaded_page = await _try_load_video_async(new_page, browser, config, position, proxy_label)
+                    if not loaded_page:
                         add_log(f"Worker {position} | Tab {tab_i+1} load failed, skipping", "warn")
-                        if len(driver.window_handles) > 1:
-                            driver.close()
-                            driver.switch_to.window(driver.window_handles[0])
+                        try:
+                            await new_page.close()
+                        except Exception:
+                            pass
                         continue
 
-                    _watch_video(driver, config, position, proxy_label)
+                    await _watch_video_async(loaded_page, config, position, proxy_label)
                     session_views += 1
 
-                    # Close tab, keep first for reuse
-                    if len(driver.window_handles) > 1:
-                        driver.close()
-                        driver.switch_to.window(driver.window_handles[0])
+                    # Close tab
+                    try:
+                        await loaded_page.close()
+                    except Exception:
+                        pass
 
-                    sleep(uniform(1, 3))
+                    await asyncio.sleep(uniform(1, 3))
 
                 except Exception as e:
                     add_log(f"Worker {position} | Tab {tab_i+1} error: {str(e)[:80]}", "warn")
-                    try:
-                        if len(driver.window_handles) > 1:
-                            driver.close()
-                            driver.switch_to.window(driver.window_handles[0])
-                    except Exception:
-                        break
 
             add_log(f"Worker {position} | Session done: {session_views} views from {proxy_label}", "success")
-            return  # Success, exit retry loop
+            return  # Success
 
         except Exception as e:
             err_msg = str(e)[:150]
@@ -688,11 +525,20 @@ def worker_multitab(position, proxy, proxy_type, config):
                 add_log(f"Worker {position} | Retry {attempt+1}: {err_msg}", "warn")
         finally:
             bot_state["workers"].pop(position, None)
-            if driver:
+            if browser:
                 try:
-                    driver.quit()
+                    browser.stop()
                 except Exception:
                     pass
+
+
+def worker_multitab(position, proxy, proxy_type, config):
+    """Thread-safe wrapper: runs async nodriver worker in its own event loop."""
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_worker_multitab_async(position, proxy, proxy_type, config))
+    finally:
+        loop.close()
 
 
 def run_bot(config):
