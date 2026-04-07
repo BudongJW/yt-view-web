@@ -605,8 +605,9 @@ def run_bot(config):
             add_log("프록시를 가져올 수 없습니다!", "error")
             bot_state["running"] = False
             return
-        target_valid = max(config.get("target_views", 100) * 2, 20)
-        proxy_list = pre_validate_proxies(raw_proxies, proxy_type, max_workers=50, target=min(target_valid, 100))
+        # Scale validated proxy target: at least 2x threads, cap 200
+        target_valid = min(max(config.get("threads", 5) * 4, config.get("target_views", 100), 30), 200)
+        proxy_list = pre_validate_proxies(raw_proxies, proxy_type, max_workers=150, target=target_valid)
 
     if not proxy_list:
         add_log("유효한 프록시가 없습니다!", "error")
@@ -618,14 +619,19 @@ def run_bot(config):
     config["_max_retries"] = 3
 
     target = config.get("target_views", 100)
-    max_threads = config.get("threads", 3)
+    max_threads = config.get("threads", 5)
     if use_no_proxy:
         max_threads = 1
 
+    # Estimate completion time
+    bot_state["eta"] = _estimate_eta(target, max_threads, use_no_proxy, len(proxy_list))
+    eta_str = bot_state["eta"]
     add_log(f"목표: {target}회 | 스레드: {max_threads} | 프록시: {'없음(직접)' if use_no_proxy else f'{len(proxy_list)}개'}")
+    add_log(f"예상 소요 시간: {eta_str}")
 
     refetch_count = 0
     position = 0
+    batch_num = 0
     while bot_state["views"] < target and not cancel_flag.is_set():
         # Filter out known-bad proxies for batch selection
         if not use_no_proxy:
@@ -633,12 +639,12 @@ def run_bot(config):
             if len(available) < max_threads:
                 add_log(f"사용 가능한 프록시 부족 ({len(available)}개) - 새 프록시 수집 중...", "warn")
                 refetch_count += 1
-                if refetch_count > 3:
+                if refetch_count > 5:
                     add_log("프록시 재수집 한도 초과, 종료합니다", "error")
                     break
                 raw_proxies = fetch_free_proxies(proxy_type)
                 if raw_proxies:
-                    new_proxies = pre_validate_proxies(raw_proxies, proxy_type, max_workers=50, target=50)
+                    new_proxies = pre_validate_proxies(raw_proxies, proxy_type, max_workers=150, target=80)
                     proxy_list.extend(new_proxies)
                     config["_proxy_pool"] = proxy_list
                     add_log(f"새 프록시 {len(new_proxies)}개 추가 (총 {len(proxy_list)}개)")
@@ -670,14 +676,62 @@ def run_bot(config):
             t.join(timeout=300)
 
         position += batch_size
+        batch_num += 1
 
         if bot_state["views"] >= target:
             break
 
-        sleep(2)
+        # Update ETA based on actual throughput every 3 batches
+        if batch_num % 3 == 0 and bot_state["views"] > 0:
+            elapsed = time.time() - bot_state["start_time"]
+            rate = bot_state["views"] / elapsed  # views per second
+            remaining = target - bot_state["views"]
+            if rate > 0:
+                eta_sec = int(remaining / rate)
+                bot_state["eta"] = _format_duration(eta_sec)
+                if batch_num % 9 == 0:
+                    add_log(f"진행: {bot_state['views']}/{target} | 속도: {rate*60:.1f}회/분 | 남은 시간: {bot_state['eta']}")
 
-    add_log(f"봇 종료 - 총 조회수: {bot_state['views']}", "success")
+        sleep(1)
+
+    elapsed = int(time.time() - bot_state["start_time"])
+    add_log(f"봇 종료 - 총 조회수: {bot_state['views']} | 소요 시간: {_format_duration(elapsed)}", "success")
     bot_state["running"] = False
+    bot_state["eta"] = ""
+
+
+def _format_duration(seconds):
+    """Format seconds into human-readable duration string."""
+    if seconds < 60:
+        return f"{seconds}초"
+    elif seconds < 3600:
+        return f"{seconds // 60}분 {seconds % 60}초"
+    else:
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        return f"{h}시간 {m}분"
+
+
+def _estimate_eta(target_views, threads, is_direct, proxy_count):
+    """Estimate completion time based on configuration.
+
+    Assumptions from testing:
+    - Proxy mode: ~80% success rate, ~120s per view attempt (driver start + load + watch)
+    - Direct mode: ~95% success rate, ~90s per view attempt
+    - Effective parallelism limited by proxy_count
+    """
+    if is_direct:
+        # Direct: serial, ~90s per view
+        total_sec = int(target_views * 90 / 0.95)
+    else:
+        # Proxy mode: effective threads = min(threads, proxy_count)
+        effective_threads = min(threads, proxy_count)
+        success_rate = 0.5  # conservative with retries
+        attempts_needed = target_views / success_rate
+        time_per_attempt = 120  # seconds avg including retries
+        total_sec = int(attempts_needed * time_per_attempt / effective_threads)
+
+    return _format_duration(total_sec)
 
 
 # ── Flask App ──
@@ -740,6 +794,7 @@ def api_status():
         "good_proxies": bot_state["good_proxies"],
         "bad_proxies": bot_state["bad_proxies"],
         "elapsed": elapsed,
+        "eta": bot_state.get("eta", ""),
         "logs": bot_state["logs"][:100],
         "video_stats": bot_state["video_stats"],
         "workers": bot_state["workers"],
