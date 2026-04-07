@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YT View Web Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: #0f0f1a;
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+        .header {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            padding: 20px 30px;
+            border-bottom: 1px solid #2a2a4a;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .header h1 {
+            font-size: 22px;
+            color: #fff;
+        }
+        .header h1 span { color: #ff4444; }
+        .header .badge {
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .badge-idle { background: #333; color: #999; }
+        .badge-running { background: #1b4332; color: #52b788; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
+
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+
+        /* Config Panel */
+        .config-panel {
+            background: #1a1a2e;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 20px;
+            border: 1px solid #2a2a4a;
+        }
+        .config-panel h2 {
+            font-size: 16px;
+            margin-bottom: 16px;
+            color: #aaa;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        .form-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 16px;
+        }
+        .form-group { display: flex; flex-direction: column; gap: 6px; }
+        .form-group label {
+            font-size: 13px;
+            color: #888;
+            font-weight: 500;
+        }
+        .form-group input, .form-group select, .form-group textarea {
+            background: #0f0f1a;
+            border: 1px solid #2a2a4a;
+            border-radius: 8px;
+            padding: 10px 14px;
+            color: #e0e0e0;
+            font-size: 14px;
+            transition: border-color 0.2s;
+        }
+        .form-group input:focus, .form-group select:focus, .form-group textarea:focus {
+            outline: none;
+            border-color: #ff4444;
+        }
+        .form-group textarea { resize: vertical; min-height: 60px; font-family: monospace; font-size: 12px; }
+        .form-group.full { grid-column: 1 / -1; }
+
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding-top: 22px;
+        }
+        .checkbox-group input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            accent-color: #ff4444;
+        }
+
+        .btn-row { display: flex; gap: 12px; margin-top: 20px; }
+        .btn {
+            padding: 12px 28px;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .btn-start { background: #ff4444; color: #fff; }
+        .btn-start:hover { background: #ff6666; }
+        .btn-start:disabled { background: #444; color: #666; cursor: not-allowed; }
+        .btn-stop { background: #333; color: #ff4444; border: 1px solid #ff4444; }
+        .btn-stop:hover { background: #441111; }
+        .btn-fetch { background: #1a3a2a; color: #52b788; }
+        .btn-fetch:hover { background: #1b4332; }
+
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background: #1a1a2e;
+            border-radius: 10px;
+            padding: 16px;
+            border: 1px solid #2a2a4a;
+            text-align: center;
+        }
+        .stat-card .value {
+            font-size: 28px;
+            font-weight: 700;
+            color: #fff;
+        }
+        .stat-card .label {
+            font-size: 12px;
+            color: #666;
+            margin-top: 4px;
+            text-transform: uppercase;
+        }
+        .stat-card.views .value { color: #ff4444; }
+        .stat-card.good .value { color: #52b788; }
+        .stat-card.bad .value { color: #e5383b; }
+        .stat-card.time .value { color: #4dabf7; font-size: 22px; }
+
+        /* Progress Bar */
+        .progress-container {
+            background: #1a1a2e;
+            border-radius: 10px;
+            padding: 16px;
+            margin-bottom: 20px;
+            border: 1px solid #2a2a4a;
+        }
+        .progress-bar-wrap {
+            background: #0f0f1a;
+            border-radius: 6px;
+            height: 24px;
+            overflow: hidden;
+            margin-top: 8px;
+        }
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #ff4444, #ff6b6b);
+            border-radius: 6px;
+            transition: width 0.5s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            font-weight: 600;
+            color: #fff;
+            min-width: 40px;
+        }
+
+        /* Panels Row */
+        .panels-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        @media (max-width: 800px) { .panels-row { grid-template-columns: 1fr; } }
+
+        .panel {
+            background: #1a1a2e;
+            border-radius: 10px;
+            padding: 16px;
+            border: 1px solid #2a2a4a;
+            max-height: 400px;
+            display: flex;
+            flex-direction: column;
+        }
+        .panel h3 {
+            font-size: 14px;
+            color: #aaa;
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        /* Logs */
+        .log-container {
+            flex: 1;
+            overflow-y: auto;
+            font-family: 'Cascadia Code', 'Fira Code', monospace;
+            font-size: 12px;
+            line-height: 1.6;
+        }
+        .log-entry { padding: 2px 0; border-bottom: 1px solid #1f1f3a; }
+        .log-entry .time { color: #4dabf7; }
+        .log-entry.info .msg { color: #c0c0c0; }
+        .log-entry.success .msg { color: #52b788; }
+        .log-entry.error .msg { color: #e5383b; }
+        .log-entry.warn .msg { color: #fca311; }
+
+        /* Video Stats */
+        .video-stats-list { flex: 1; overflow-y: auto; }
+        .video-stat-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #1f1f3a;
+            font-size: 13px;
+        }
+        .video-stat-item .title { color: #c0c0c0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: 12px; }
+        .video-stat-item .count { color: #ff4444; font-weight: 600; min-width: 40px; text-align: right; }
+
+        /* Workers */
+        .workers-list { flex: 1; overflow-y: auto; }
+        .worker-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 0;
+            border-bottom: 1px solid #1f1f3a;
+            font-size: 12px;
+        }
+        .worker-dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: #52b788;
+            animation: pulse 1s infinite;
+        }
+
+        /* scrollbar */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #0f0f1a; }
+        ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1><span>YT</span> View Web Dashboard</h1>
+        <span id="statusBadge" class="badge badge-idle">IDLE</span>
+    </div>
+
+    <div class="container">
+        <!-- Config -->
+        <div class="config-panel">
+            <h2>Settings</h2>
+            <div class="form-grid">
+                <div class="form-group full">
+                    <label>YouTube URL</label>
+                    <input type="text" id="url" placeholder="https://www.youtube.com/watch?v=..." />
+                </div>
+                <div class="form-group">
+                    <label>Target Views</label>
+                    <input type="number" id="targetViews" value="50" min="1" max="10000" />
+                </div>
+                <div class="form-group">
+                    <label>Threads</label>
+                    <input type="number" id="threads" value="3" min="1" max="20" />
+                </div>
+                <div class="form-group">
+                    <label>Proxy Type</label>
+                    <select id="proxyType">
+                        <option value="http">HTTP</option>
+                        <option value="socks5">SOCKS5</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Proxy Source</label>
+                    <select id="proxySource" onchange="toggleCustomProxy()">
+                        <option value="auto">Auto (Free)</option>
+                        <option value="none">No Proxy (Direct)</option>
+                        <option value="custom">Custom List</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Min Watch %</label>
+                    <input type="number" id="minDuration" value="70" min="10" max="100" />
+                </div>
+                <div class="form-group">
+                    <label>Max Watch %</label>
+                    <input type="number" id="maxDuration" value="95" min="10" max="100" />
+                </div>
+                <div class="form-group">
+                    <label>Playback Speed</label>
+                    <select id="playbackSpeed">
+                        <option value="1">Normal (1x)</option>
+                        <option value="0.75">Slow (0.75x)</option>
+                        <option value="1.5">Fast (1.5x)</option>
+                        <option value="2">2x</option>
+                    </select>
+                </div>
+                <div class="checkbox-group">
+                    <input type="checkbox" id="headless" checked />
+                    <label for="headless">Headless (Background)</label>
+                </div>
+                <div class="checkbox-group">
+                    <input type="checkbox" id="saveBandwidth" checked />
+                    <label for="saveBandwidth">Save Bandwidth</label>
+                </div>
+                <div class="form-group full" id="customProxyGroup" style="display:none;">
+                    <label>Custom Proxy List (IP:PORT per line)</label>
+                    <textarea id="customProxies" rows="4" placeholder="123.45.67.89:8080&#10;98.76.54.32:1080"></textarea>
+                </div>
+            </div>
+            <div class="btn-row">
+                <button class="btn btn-start" id="btnStart" onclick="startBot()">Start</button>
+                <button class="btn btn-stop" id="btnStop" onclick="stopBot()" disabled>Stop</button>
+                <button class="btn btn-fetch" onclick="fetchProxies()">Test Proxy Fetch</button>
+            </div>
+        </div>
+
+        <!-- Stats -->
+        <div class="stats-grid">
+            <div class="stat-card views">
+                <div class="value" id="statViews">0</div>
+                <div class="label">Views</div>
+            </div>
+            <div class="stat-card">
+                <div class="value" id="statTarget">0</div>
+                <div class="label">Target</div>
+            </div>
+            <div class="stat-card good">
+                <div class="value" id="statGood">0</div>
+                <div class="label">Good Proxy</div>
+            </div>
+            <div class="stat-card bad">
+                <div class="value" id="statBad">0</div>
+                <div class="label">Bad Proxy</div>
+            </div>
+            <div class="stat-card">
+                <div class="value" id="statErrors">0</div>
+                <div class="label">Errors</div>
+            </div>
+            <div class="stat-card time">
+                <div class="value" id="statTime">00:00</div>
+                <div class="label">Elapsed</div>
+            </div>
+        </div>
+
+        <!-- Progress -->
+        <div class="progress-container">
+            <div style="display:flex; justify-content:space-between; font-size:13px;">
+                <span>Progress</span>
+                <span id="progressText">0 / 0</span>
+            </div>
+            <div class="progress-bar-wrap">
+                <div class="progress-bar" id="progressBar" style="width:0%">0%</div>
+            </div>
+        </div>
+
+        <!-- Panels -->
+        <div class="panels-row">
+            <div class="panel">
+                <h3>Live Logs</h3>
+                <div class="log-container" id="logContainer"></div>
+            </div>
+            <div class="panel">
+                <h3>Video Stats</h3>
+                <div class="video-stats-list" id="videoStats">
+                    <div style="color:#555; text-align:center; padding:40px;">No data yet</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="panels-row">
+            <div class="panel">
+                <h3>Active Workers</h3>
+                <div class="workers-list" id="workersList">
+                    <div style="color:#555; text-align:center; padding:40px;">No active workers</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let pollInterval = null;
+
+        function toggleCustomProxy() {
+            const src = document.getElementById('proxySource').value;
+            document.getElementById('customProxyGroup').style.display = src === 'custom' ? 'block' : 'none';
+        }
+
+        async function startBot() {
+            const url = document.getElementById('url').value.trim();
+            if (!url) { alert('YouTube URL을 입력하세요!'); return; }
+
+            const config = {
+                url,
+                target_views: document.getElementById('targetViews').value,
+                threads: document.getElementById('threads').value,
+                proxy_type: document.getElementById('proxyType').value,
+                proxy_source: document.getElementById('proxySource').value,
+                custom_proxies: document.getElementById('customProxies').value,
+                min_duration: document.getElementById('minDuration').value,
+                max_duration: document.getElementById('maxDuration').value,
+                playback_speed: document.getElementById('playbackSpeed').value,
+                headless: document.getElementById('headless').checked,
+                save_bandwidth: document.getElementById('saveBandwidth').checked,
+            };
+
+            try {
+                const resp = await fetch('/api/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config),
+                });
+                const data = await resp.json();
+                if (data.error) { alert(data.error); return; }
+
+                document.getElementById('btnStart').disabled = true;
+                document.getElementById('btnStop').disabled = false;
+                document.getElementById('statusBadge').className = 'badge badge-running';
+                document.getElementById('statusBadge').textContent = 'RUNNING';
+
+                if (!pollInterval) {
+                    pollInterval = setInterval(pollStatus, 1500);
+                }
+            } catch (e) {
+                alert('서버 연결 실패: ' + e.message);
+            }
+        }
+
+        async function stopBot() {
+            await fetch('/api/stop', { method: 'POST' });
+            document.getElementById('btnStart').disabled = false;
+            document.getElementById('btnStop').disabled = true;
+            document.getElementById('statusBadge').className = 'badge badge-idle';
+            document.getElementById('statusBadge').textContent = 'STOPPED';
+        }
+
+        async function fetchProxies() {
+            const type = document.getElementById('proxyType').value;
+            const resp = await fetch('/api/fetch-proxies', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ proxy_type: type }),
+            });
+            const data = await resp.json();
+            alert(`${type.toUpperCase()} Proxy ${data.count}개 수집됨\n\nSample:\n${data.proxies.slice(0, 10).join('\n')}`);
+        }
+
+        async function pollStatus() {
+            try {
+                const resp = await fetch('/api/status');
+                const s = await resp.json();
+
+                document.getElementById('statViews').textContent = s.views;
+                document.getElementById('statTarget').textContent = s.target_views;
+                document.getElementById('statGood').textContent = s.good_proxies;
+                document.getElementById('statBad').textContent = s.bad_proxies;
+                document.getElementById('statErrors').textContent = s.errors;
+
+                // Time
+                const mins = Math.floor(s.elapsed / 60);
+                const secs = s.elapsed % 60;
+                document.getElementById('statTime').textContent =
+                    `${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`;
+
+                // Progress
+                const pct = s.target_views > 0 ? Math.min(100, Math.round(s.views / s.target_views * 100)) : 0;
+                document.getElementById('progressBar').style.width = pct + '%';
+                document.getElementById('progressBar').textContent = pct + '%';
+                document.getElementById('progressText').textContent = `${s.views} / ${s.target_views}`;
+
+                // Logs
+                const logHtml = s.logs.map(l =>
+                    `<div class="log-entry ${l.level}"><span class="time">[${l.time}]</span> <span class="msg">${l.msg}</span></div>`
+                ).join('');
+                document.getElementById('logContainer').innerHTML = logHtml;
+
+                // Video Stats
+                const statsEntries = Object.entries(s.video_stats);
+                if (statsEntries.length > 0) {
+                    document.getElementById('videoStats').innerHTML = statsEntries.map(([title, count]) =>
+                        `<div class="video-stat-item"><span class="title">${title}</span><span class="count">${count}</span></div>`
+                    ).join('');
+                }
+
+                // Workers
+                const workers = Object.entries(s.workers);
+                if (workers.length > 0) {
+                    document.getElementById('workersList').innerHTML = workers.map(([id, w]) =>
+                        `<div class="worker-item">
+                            <div class="worker-dot"></div>
+                            <span>Worker ${id}</span>
+                            <span style="color:#666">|</span>
+                            <span style="color:#888">${w.proxy || ''}</span>
+                            <span style="color:#666">|</span>
+                            <span style="color:#52b788">${w.status || ''}</span>
+                            ${w.title ? `<span style="color:#666">|</span><span>${w.title || ''}</span>` : ''}
+                        </div>`
+                    ).join('');
+                } else {
+                    document.getElementById('workersList').innerHTML =
+                        '<div style="color:#555; text-align:center; padding:40px;">No active workers</div>';
+                }
+
+                // Auto-stop UI when done
+                if (!s.running && document.getElementById('btnStart').disabled) {
+                    document.getElementById('btnStart').disabled = false;
+                    document.getElementById('btnStop').disabled = true;
+                    document.getElementById('statusBadge').className = 'badge badge-idle';
+                    document.getElementById('statusBadge').textContent = 'DONE';
+                }
+            } catch (e) {
+                console.error('Poll error:', e);
+            }
+        }
+
+        // Start polling on load
+        pollInterval = setInterval(pollStatus, 2000);
+    </script>
+</body>
+</html>
