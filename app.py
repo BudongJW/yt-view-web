@@ -590,6 +590,128 @@ def api_fetch_proxies():
     return jsonify({"count": len(proxies), "proxies": proxies[:50]})
 
 
+@app.route("/api/validate-url", methods=["POST"])
+def api_validate_url():
+    """Validate YouTube URL and return video metadata (title, thumbnail, duration, views)."""
+    data = request.json or {}
+    url = data.get("url", "").strip()
+
+    if not url:
+        return jsonify({"valid": False, "error": "URL을 입력하세요"})
+
+    # Extract video ID
+    import re as _re
+    vid_match = _re.search(r"(?:v=|youtu\.be/|shorts/)([0-9A-Za-z_-]{11})", url)
+    if not vid_match:
+        return jsonify({"valid": False, "error": "유효한 YouTube URL이 아닙니다"})
+
+    video_id = vid_match.group(1)
+
+    try:
+        # Fetch oembed data (no API key needed)
+        oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+        resp = requests.get(oembed_url, timeout=10)
+        if resp.status_code != 200:
+            return jsonify({"valid": False, "error": "영상을 찾을 수 없습니다 (비공개 또는 삭제됨)"})
+
+        oembed = resp.json()
+        title = oembed.get("title", "Unknown")
+        author = oembed.get("author_name", "Unknown")
+        thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+
+        # Try to get additional info from page
+        page_resp = requests.get(
+            f"https://www.youtube.com/watch?v={video_id}",
+            headers={"User-Agent": CHROME_UA, "Accept-Language": "en-US,en;q=0.9"},
+            timeout=10,
+        )
+        view_count = ""
+        duration_text = ""
+        if page_resp.status_code == 200:
+            vc_match = _re.search(r'"viewCount"\s*:\s*"(\d+)"', page_resp.text)
+            if vc_match:
+                view_count = f"{int(vc_match.group(1)):,}"
+            dur_match = _re.search(r'"lengthSeconds"\s*:\s*"(\d+)"', page_resp.text)
+            if dur_match:
+                secs = int(dur_match.group(1))
+                duration_text = strftime("%M:%S", gmtime(secs)) if secs < 3600 else strftime("%H:%M:%S", gmtime(secs))
+
+        return jsonify({
+            "valid": True,
+            "video_id": video_id,
+            "title": title,
+            "author": author,
+            "thumbnail": thumbnail,
+            "view_count": view_count,
+            "duration": duration_text,
+        })
+
+    except Exception as e:
+        return jsonify({"valid": False, "error": f"검증 실패: {str(e)}"})
+
+
+@app.route("/api/verify-result", methods=["POST"])
+def api_verify_result():
+    """After bot run, re-fetch video info to check if view count changed."""
+    data = request.json or {}
+    url = data.get("url", "").strip()
+
+    import re as _re
+    vid_match = _re.search(r"(?:v=|youtu\.be/|shorts/)([0-9A-Za-z_-]{11})", url)
+    if not vid_match:
+        return jsonify({"error": "유효한 URL 아님"})
+
+    video_id = vid_match.group(1)
+
+    try:
+        page_resp = requests.get(
+            f"https://www.youtube.com/watch?v={video_id}",
+            headers={"User-Agent": CHROME_UA, "Accept-Language": "en-US,en;q=0.9"},
+            timeout=10,
+        )
+        view_count = 0
+        view_text = ""
+        if page_resp.status_code == 200:
+            vc_match = _re.search(r'"viewCount"\s*:\s*"(\d+)"', page_resp.text)
+            if vc_match:
+                view_count = int(vc_match.group(1))
+                view_text = f"{view_count:,}"
+
+        return jsonify({
+            "video_id": video_id,
+            "current_views": view_count,
+            "current_views_text": view_text,
+            "bot_views": bot_state["views"],
+            "bot_errors": bot_state["errors"],
+            "bot_elapsed": int(time.time() - bot_state["start_time"]) if bot_state["start_time"] else 0,
+            "video_stats": bot_state["video_stats"],
+        })
+    except Exception as e:
+        return jsonify({"error": f"검증 실패: {str(e)}"})
+
+
+@app.route("/api/logs")
+def api_logs():
+    """Return full logs with filtering support."""
+    level = request.args.get("level", "all")
+    limit = int(request.args.get("limit", 200))
+
+    logs = bot_state["logs"]
+    if level != "all":
+        logs = [l for l in logs if l["level"] == level]
+
+    return jsonify({
+        "logs": logs[:limit],
+        "total": len(bot_state["logs"]),
+        "counts": {
+            "info": sum(1 for l in bot_state["logs"] if l["level"] == "info"),
+            "success": sum(1 for l in bot_state["logs"] if l["level"] == "success"),
+            "error": sum(1 for l in bot_state["logs"] if l["level"] == "error"),
+            "warn": sum(1 for l in bot_state["logs"] if l["level"] == "warn"),
+        },
+    })
+
+
 if __name__ == "__main__":
     print("\n" + "=" * 50)
     print("  YouTube View Web Dashboard")
