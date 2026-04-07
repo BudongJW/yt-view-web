@@ -571,6 +571,130 @@ def worker_view(position, proxy, proxy_type, config):
                     pass
 
 
+def worker_multitab(position, proxy, proxy_type, config):
+    """Efficient worker: opens ONE Chrome and cycles multiple views via new tabs.
+    Includes proxy retry on first-tab failure (up to 3 proxies).
+    Dramatically reduces RAM usage (~75MB per tab vs ~500MB per Chrome instance)."""
+    if cancel_flag.is_set():
+        return
+
+    is_direct = (proxy == "__direct__")
+    proxy_pool = config.get("_proxy_pool", [proxy])
+    max_retries = 1 if is_direct else 3
+    views_per_session = config.get("_views_per_session", 5)
+
+    for attempt in range(max_retries):
+        if cancel_flag.is_set():
+            return
+
+        # Rotate proxy on retry
+        if attempt > 0 and not is_direct:
+            available = [p for p in proxy_pool if not is_bad_proxy(p)]
+            if not available:
+                break
+            proxy = choice(available)
+
+        clean_proxy = proxy if is_direct else strip_proxy_prefix(proxy)
+        proxy_label = "Direct" if is_direct else clean_proxy
+
+        if not is_direct and is_bad_proxy(proxy):
+            continue
+
+        driver = None
+        try:
+            bot_state["good_proxies"] += 1
+            retry_tag = f" (retry {attempt})" if attempt > 0 else ""
+            add_log(f"Worker {position} | {proxy_label}{retry_tag} | Starting (multitab x{views_per_session})")
+
+            background = config.get("headless", True)
+            driver = get_driver(background, None, None if is_direct else clean_proxy, proxy_type)
+
+            # Spoof timezone once for the session
+            try:
+                if is_direct:
+                    geo = requests.get("http://ip-api.com/json", timeout=8).json()
+                else:
+                    pdict = {"http": f"{proxy_type}://{clean_proxy}", "https": f"{proxy_type}://{clean_proxy}"}
+                    geo = requests.get("http://ip-api.com/json", proxies=pdict, timeout=8).json()
+                driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": geo.get("timezone", "UTC")})
+                driver.execute_cdp_cmd("Emulation.setGeolocationOverride", {
+                    "latitude": geo.get("lat", 0),
+                    "longitude": geo.get("lon", 0),
+                    "accuracy": randint(20, 100),
+                })
+            except Exception:
+                pass
+
+            bot_state["workers"][position] = {"proxy": proxy_label, "status": "loading"}
+
+            # First tab: if this fails, retry with different proxy
+            if not _try_load_video(driver, config, position, proxy_label):
+                if not is_direct:
+                    mark_bad_proxy(proxy)
+                    bot_state["bad_proxies"] += 1
+                raise Exception("Video load failed")
+
+            # First tab succeeded - watch it
+            _watch_video(driver, config, position, proxy_label)
+            session_views = 1
+
+            # Continue with more tabs in the same Chrome
+            for tab_i in range(1, views_per_session):
+                if cancel_flag.is_set() or bot_state["views"] >= config.get("target_views", 100):
+                    break
+
+                bot_state["workers"][position] = {"proxy": proxy_label, "status": f"tab {tab_i+1}/{views_per_session}"}
+
+                try:
+                    # Open new tab
+                    driver.execute_script("window.open('', '_blank');")
+                    driver.switch_to.window(driver.window_handles[-1])
+
+                    if not _try_load_video(driver, config, position, proxy_label):
+                        add_log(f"Worker {position} | Tab {tab_i+1} load failed, skipping", "warn")
+                        if len(driver.window_handles) > 1:
+                            driver.close()
+                            driver.switch_to.window(driver.window_handles[0])
+                        continue
+
+                    _watch_video(driver, config, position, proxy_label)
+                    session_views += 1
+
+                    # Close tab, keep first for reuse
+                    if len(driver.window_handles) > 1:
+                        driver.close()
+                        driver.switch_to.window(driver.window_handles[0])
+
+                    sleep(uniform(1, 3))
+
+                except Exception as e:
+                    add_log(f"Worker {position} | Tab {tab_i+1} error: {str(e)[:80]}", "warn")
+                    try:
+                        if len(driver.window_handles) > 1:
+                            driver.close()
+                            driver.switch_to.window(driver.window_handles[0])
+                    except Exception:
+                        break
+
+            add_log(f"Worker {position} | Session done: {session_views} views from {proxy_label}", "success")
+            return  # Success, exit retry loop
+
+        except Exception as e:
+            err_msg = str(e)[:150]
+            if attempt == max_retries - 1:
+                bot_state["errors"] += 1
+                add_log(f"Worker {position} | FAIL after {attempt+1} tries: {err_msg}", "error")
+            else:
+                add_log(f"Worker {position} | Retry {attempt+1}: {err_msg}", "warn")
+        finally:
+            bot_state["workers"].pop(position, None)
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+
 def run_bot(config):
     cancel_flag.clear()
     bot_state["running"] = True
@@ -617,6 +741,7 @@ def run_bot(config):
     # Pass full proxy pool and retry config to workers
     config["_proxy_pool"] = proxy_list
     config["_max_retries"] = 3
+    config["_views_per_session"] = 5  # views per Chrome instance (multitab)
 
     target = config.get("target_views", 100)
     max_threads = config.get("threads", 5)
@@ -625,9 +750,9 @@ def run_bot(config):
 
     # Estimate completion time
     bot_state["eta"] = _estimate_eta(target, max_threads, use_no_proxy, len(proxy_list))
-    eta_str = bot_state["eta"]
     add_log(f"목표: {target}회 | 스레드: {max_threads} | 프록시: {'없음(직접)' if use_no_proxy else f'{len(proxy_list)}개'}")
-    add_log(f"예상 소요 시간: {eta_str}")
+    add_log(f"멀티탭 모드: Chrome당 {config['_views_per_session']}회 시청 (RAM 절약)")
+    add_log(f"예상 소요 시간: {bot_state['eta']}")
 
     refetch_count = 0
     position = 0
@@ -660,20 +785,27 @@ def run_bot(config):
             break
 
         batch_proxies = []
+        used_set = set()
         for _ in range(batch_size):
-            batch_proxies.append(choice(available))
+            # Try to pick unique proxies for each worker in batch
+            candidates = [p for p in available if p not in used_set]
+            if not candidates:
+                candidates = available
+            pick = choice(candidates)
+            used_set.add(pick)
+            batch_proxies.append(pick)
 
-        # Use raw threads instead of ThreadPoolExecutor (Windows compat)
+        # Use multitab workers for efficiency
         threads = []
         for i, proxy in enumerate(batch_proxies):
             pos = position + i
-            t = threading.Thread(target=worker_view, args=(pos, proxy, proxy_type, config))
+            t = threading.Thread(target=worker_multitab, args=(pos, proxy, proxy_type, config))
             t.daemon = True
             t.start()
             threads.append(t)
 
         for t in threads:
-            t.join(timeout=300)
+            t.join(timeout=600)  # longer timeout for multitab sessions
 
         position += batch_size
         batch_num += 1
@@ -681,15 +813,15 @@ def run_bot(config):
         if bot_state["views"] >= target:
             break
 
-        # Update ETA based on actual throughput every 3 batches
-        if batch_num % 3 == 0 and bot_state["views"] > 0:
+        # Update ETA based on actual throughput every 2 batches
+        if batch_num % 2 == 0 and bot_state["views"] > 0:
             elapsed = time.time() - bot_state["start_time"]
-            rate = bot_state["views"] / elapsed  # views per second
+            rate = bot_state["views"] / elapsed
             remaining = target - bot_state["views"]
             if rate > 0:
                 eta_sec = int(remaining / rate)
                 bot_state["eta"] = _format_duration(eta_sec)
-                if batch_num % 9 == 0:
+                if batch_num % 4 == 0:
                     add_log(f"진행: {bot_state['views']}/{target} | 속도: {rate*60:.1f}회/분 | 남은 시간: {bot_state['eta']}")
 
         sleep(1)
@@ -715,21 +847,20 @@ def _format_duration(seconds):
 def _estimate_eta(target_views, threads, is_direct, proxy_count):
     """Estimate completion time based on configuration.
 
-    Assumptions from testing:
-    - Proxy mode: ~80% success rate, ~120s per view attempt (driver start + load + watch)
-    - Direct mode: ~95% success rate, ~90s per view attempt
-    - Effective parallelism limited by proxy_count
+    Multitab mode: each Chrome does ~5 views before cycling.
+    - ~60s per view within a session (no driver restart overhead)
+    - ~30s overhead per Chrome startup
+    - ~60% success rate per tab after first
     """
     if is_direct:
-        # Direct: serial, ~90s per view
         total_sec = int(target_views * 90 / 0.95)
     else:
-        # Proxy mode: effective threads = min(threads, proxy_count)
         effective_threads = min(threads, proxy_count)
-        success_rate = 0.5  # conservative with retries
-        attempts_needed = target_views / success_rate
-        time_per_attempt = 120  # seconds avg including retries
-        total_sec = int(attempts_needed * time_per_attempt / effective_threads)
+        views_per_session = 5
+        session_time = 30 + (views_per_session * 60)  # startup + watch time
+        views_per_session_effective = views_per_session * 0.6  # success rate
+        sessions_needed = target_views / views_per_session_effective
+        total_sec = int(sessions_needed * session_time / effective_threads)
 
     return _format_duration(total_sec)
 
