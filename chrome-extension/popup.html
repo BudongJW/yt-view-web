@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      width: 380px;
+      min-height: 480px;
+      background: #0f0f0f;
+      color: #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 13px;
+    }
+    .header {
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      padding: 14px 16px;
+      border-bottom: 1px solid #333;
+      display: flex; align-items: center; gap: 10px;
+    }
+    .header h1 { font-size: 15px; font-weight: 600; color: #fff; }
+    .header .badge {
+      background: #ff4444; color: #fff; font-size: 10px; padding: 2px 6px;
+      border-radius: 10px; font-weight: 600;
+    }
+    .header .badge.running { background: #00c853; }
+
+    .section { padding: 12px 16px; border-bottom: 1px solid #222; }
+    .section-title { font-size: 11px; color: #888; text-transform: uppercase; margin-bottom: 8px; letter-spacing: 0.5px; }
+
+    label { display: block; margin-bottom: 6px; font-size: 12px; color: #aaa; }
+    input[type="text"], input[type="number"] {
+      width: 100%; padding: 8px 10px; background: #1a1a1a; border: 1px solid #333;
+      border-radius: 6px; color: #fff; font-size: 13px; outline: none;
+    }
+    input:focus { border-color: #ff4444; }
+
+    .row { display: flex; gap: 8px; }
+    .row > div { flex: 1; }
+
+    .preview {
+      margin-top: 8px; display: none; background: #1a1a1a; border-radius: 8px;
+      overflow: hidden; border: 1px solid #333;
+    }
+    .preview img { width: 100%; height: auto; display: block; }
+    .preview .info { padding: 8px 10px; }
+    .preview .info .title { font-size: 12px; font-weight: 600; color: #fff; }
+    .preview .info .channel { font-size: 11px; color: #888; margin-top: 2px; }
+
+    .btn {
+      width: 100%; padding: 10px; border: none; border-radius: 8px; font-size: 14px;
+      font-weight: 600; cursor: pointer; transition: all 0.2s;
+    }
+    .btn-start { background: #ff4444; color: #fff; }
+    .btn-start:hover { background: #ff6666; }
+    .btn-start:disabled { background: #333; color: #666; cursor: not-allowed; }
+    .btn-stop { background: #333; color: #ff4444; border: 1px solid #ff4444; }
+    .btn-stop:hover { background: #ff4444; color: #fff; }
+
+    .stats {
+      display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px;
+    }
+    .stat-card {
+      background: #1a1a1a; border-radius: 8px; padding: 10px; text-align: center;
+      border: 1px solid #222;
+    }
+    .stat-card .value { font-size: 20px; font-weight: 700; color: #fff; }
+    .stat-card .label { font-size: 10px; color: #888; margin-top: 2px; }
+    .stat-card .value.success { color: #00c853; }
+    .stat-card .value.error { color: #ff4444; }
+
+    .progress-bar {
+      width: 100%; height: 4px; background: #222; border-radius: 2px; margin-top: 8px; overflow: hidden;
+    }
+    .progress-bar .fill {
+      height: 100%; background: linear-gradient(90deg, #ff4444, #ff6644); border-radius: 2px;
+      transition: width 0.3s;
+    }
+
+    .log-area {
+      height: 140px; overflow-y: auto; background: #0a0a0a; border-radius: 6px;
+      padding: 8px; font-family: 'Consolas', 'Monaco', monospace; font-size: 11px;
+      border: 1px solid #222;
+    }
+    .log-area::-webkit-scrollbar { width: 4px; }
+    .log-area::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+    .log-line { padding: 1px 0; word-break: break-all; }
+    .log-line.success { color: #00c853; }
+    .log-line.error { color: #ff4444; }
+    .log-line.warn { color: #ffab00; }
+    .log-line.info { color: #888; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>YT View Enhancer</h1>
+    <span class="badge" id="statusBadge">STOPPED</span>
+  </div>
+
+  <div class="section">
+    <div class="section-title">YouTube URL</div>
+    <input type="text" id="urlInput" placeholder="https://www.youtube.com/watch?v=..." />
+    <div class="preview" id="preview">
+      <img id="previewImg" src="" alt="" />
+      <div class="info">
+        <div class="title" id="previewTitle"></div>
+        <div class="channel" id="previewChannel"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Settings</div>
+    <div class="row">
+      <div>
+        <label>Target Views</label>
+        <input type="number" id="targetViews" value="10" min="1" max="1000" />
+      </div>
+      <div>
+        <label>Concurrent Tabs</label>
+        <input type="number" id="maxConcurrent" value="1" min="1" max="5" />
+      </div>
+    </div>
+    <div class="row" style="margin-top: 6px;">
+      <div>
+        <label>Min Watch %</label>
+        <input type="number" id="minWatchPct" value="70" min="30" max="100" />
+      </div>
+      <div>
+        <label>Max Watch %</label>
+        <input type="number" id="maxWatchPct" value="95" min="50" max="100" />
+      </div>
+    </div>
+    <div style="margin-top: 6px;">
+      <label>Delay Between (sec)</label>
+      <input type="number" id="delayBetween" value="5" min="1" max="120" />
+    </div>
+  </div>
+
+  <div class="section">
+    <button class="btn btn-start" id="btnStart">Start</button>
+    <button class="btn btn-stop" id="btnStop" style="display:none; margin-top: 6px;">Stop</button>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Progress</div>
+    <div class="stats">
+      <div class="stat-card">
+        <div class="value success" id="viewCount">0</div>
+        <div class="label">Views</div>
+      </div>
+      <div class="stat-card">
+        <div class="value error" id="errorCount">0</div>
+        <div class="label">Errors</div>
+      </div>
+      <div class="stat-card">
+        <div class="value" id="targetCount">0</div>
+        <div class="label">Target</div>
+      </div>
+    </div>
+    <div class="progress-bar"><div class="fill" id="progressFill" style="width:0%"></div></div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Logs</div>
+    <div class="log-area" id="logArea"></div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

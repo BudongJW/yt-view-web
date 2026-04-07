@@ -7,7 +7,6 @@ import os
 import shutil
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime
 from random import choice, choices, randint, uniform
 from time import gmtime, sleep, strftime
@@ -99,13 +98,37 @@ def fetch_free_proxies(proxy_type="http"):
     return list(proxies)
 
 
-def check_proxy(proxy, proxy_type="http", timeout=5):
+def strip_proxy_prefix(proxy):
+    """Remove protocol prefix from proxy string."""
+    for prefix in ["http://", "https://", "socks5://", "socks4://"]:
+        if proxy.startswith(prefix):
+            return proxy[len(prefix):]
+    return proxy
+
+
+def check_proxy_youtube(proxy, proxy_type="http", timeout=8):
+    """Validate proxy by actually hitting YouTube (more reliable than ip-api)."""
     try:
-        # Strip protocol prefix if present
-        clean = proxy
-        for prefix in ["http://", "https://", "socks5://", "socks4://"]:
-            if clean.startswith(prefix):
-                clean = clean[len(prefix):]
+        clean = strip_proxy_prefix(proxy)
+        proxy_dict = {
+            "http": f"{proxy_type}://{clean}",
+            "https": f"{proxy_type}://{clean}",
+        }
+        resp = requests.get(
+            "https://www.youtube.com/robots.txt",
+            proxies=proxy_dict,
+            timeout=timeout,
+            headers={"User-Agent": CHROME_UA},
+        )
+        return resp.status_code == 200 and "Disallow" in resp.text
+    except Exception:
+        return False
+
+
+def check_proxy(proxy, proxy_type="http", timeout=5):
+    """Quick check via ip-api (used as first filter)."""
+    try:
+        clean = strip_proxy_prefix(proxy)
         proxy_dict = {
             "http": f"{proxy_type}://{clean}",
             "https": f"{proxy_type}://{clean}",
@@ -120,39 +143,89 @@ def check_proxy(proxy, proxy_type="http", timeout=5):
         return False
 
 
-def pre_validate_proxies(proxy_list, proxy_type="http", max_workers=30, target=20):
-    """Validate proxies in parallel using threads directly (avoid nested ThreadPoolExecutor on Windows)."""
+# Shared bad proxy set to avoid reuse across batches
+_bad_proxy_set = set()
+_bad_proxy_lock = threading.Lock()
+
+
+def mark_bad_proxy(proxy):
+    with _bad_proxy_lock:
+        _bad_proxy_set.add(strip_proxy_prefix(proxy))
+
+
+def is_bad_proxy(proxy):
+    with _bad_proxy_lock:
+        return strip_proxy_prefix(proxy) in _bad_proxy_set
+
+
+def pre_validate_proxies(proxy_list, proxy_type="http", max_workers=40, target=30):
+    """Two-stage validation: quick ip-api check, then YouTube reachability."""
     import random
-    valid = []
+    stage1_valid = []
+    final_valid = []
     lock = threading.Lock()
     done_event = threading.Event()
 
-    add_log(f"프록시 사전 검증 시작 (후보 {len(proxy_list)}개, 목표 {target}개)...")
+    add_log(f"프록시 검증 시작 (후보 {len(proxy_list)}개, 목표 {target}개)...")
 
-    sample = random.sample(proxy_list, min(200, len(proxy_list)))
+    sample = random.sample(proxy_list, min(400, len(proxy_list)))
 
-    def _check(proxy):
+    # Stage 1: Quick ip-api check
+    def _quick_check(proxy):
         if done_event.is_set() or cancel_flag.is_set():
             return
         if check_proxy(proxy, proxy_type, 5):
             with lock:
-                valid.append(proxy)
-                add_log(f"  Valid proxy: {proxy}", "success")
-                if len(valid) >= target:
+                stage1_valid.append(proxy)
+                if len(stage1_valid) >= target * 3:
                     done_event.set()
 
     threads_list = []
     for p in sample:
         if done_event.is_set():
             break
-        t = threading.Thread(target=_check, args=(p,), daemon=True)
+        t = threading.Thread(target=_quick_check, args=(p,), daemon=True)
         threads_list.append(t)
         t.start()
-        # Limit concurrent threads
         while sum(1 for t in threads_list if t.is_alive()) >= max_workers:
             sleep(0.1)
 
-    # Wait for remaining threads (max 30s)
+    deadline = time.time() + 20
+    for t in threads_list:
+        remaining = max(0, deadline - time.time())
+        t.join(timeout=remaining)
+        if time.time() >= deadline or done_event.is_set():
+            break
+
+    add_log(f"Stage 1 (ip-api): {len(stage1_valid)}개 통과")
+
+    if not stage1_valid:
+        add_log("Stage 1 통과 프록시 없음", "error")
+        return []
+
+    # Stage 2: YouTube reachability check
+    done_event.clear()
+    threads_list = []
+
+    def _yt_check(proxy):
+        if done_event.is_set() or cancel_flag.is_set():
+            return
+        if check_proxy_youtube(proxy, proxy_type, 8):
+            with lock:
+                final_valid.append(proxy)
+                add_log(f"  YouTube OK: {strip_proxy_prefix(proxy)}", "success")
+                if len(final_valid) >= target:
+                    done_event.set()
+
+    for p in stage1_valid:
+        if done_event.is_set():
+            break
+        t = threading.Thread(target=_yt_check, args=(p,), daemon=True)
+        threads_list.append(t)
+        t.start()
+        while sum(1 for t in threads_list if t.is_alive()) >= max_workers:
+            sleep(0.1)
+
     deadline = time.time() + 30
     for t in threads_list:
         remaining = max(0, deadline - time.time())
@@ -160,8 +233,8 @@ def pre_validate_proxies(proxy_list, proxy_type="http", max_workers=30, target=2
         if time.time() >= deadline or done_event.is_set():
             break
 
-    add_log(f"프록시 검증 완료: {len(valid)}개 유효", "success" if valid else "error")
-    return valid
+    add_log(f"Stage 2 (YouTube): {len(final_valid)}개 유효", "success" if final_valid else "error")
+    return final_valid
 
 
 # ── Chrome Driver ──
@@ -282,155 +355,208 @@ def save_bandwidth(driver):
 
 
 # ── Main Worker ──
-def worker_view(position, proxy, proxy_type, config):
-    if cancel_flag.is_set():
-        return
+def _try_load_video(driver, config, position, proxy_label):
+    """Navigate to YouTube video and wait for player. Returns True on success."""
+    url = config["url"]
 
-    driver = None
+    driver.get(url)
+    sleep(4)
+
+    # Handle supported_browsers redirect
+    if "supported_browsers" in driver.current_url:
+        add_log(f"Worker {position} | supported_browsers redirect - retrying", "warn")
+        driver.get(url)
+        sleep(4)
+
+    # Bypass consent if redirected
+    if "consent" in driver.current_url:
+        bypass_consent(driver)
+        sleep(2)
+        if "consent" in driver.current_url:
+            driver.get(url)
+            sleep(4)
+
+    # Wait for player
     try:
-        header = Headers(browser="chrome", os="win", headers=False).generate()
-        agent = header["User-Agent"]
+        WebDriverWait(driver, 40).until(
+            EC.presence_of_element_located((By.ID, "movie_player"))
+        )
+        sleep(3)
+        return True
+    except Exception:
+        cur_url = driver.current_url
+        if "supported_browsers" in cur_url:
+            add_log(f"Worker {position} | {proxy_label} | YouTube blocked (unsupported browser)", "warn")
+        else:
+            add_log(f"Worker {position} | {proxy_label} | Player load failed | url={cur_url[:80]}", "warn")
+        return False
 
-        is_direct = (proxy == "__direct__")
 
-        if not is_direct:
-            # Strip protocol prefix if present
-            for prefix in ["http://", "https://", "socks5://", "socks4://"]:
-                if proxy.startswith(prefix):
-                    proxy = proxy[len(prefix):]
+def _watch_video(driver, config, position, proxy_label):
+    """Play and watch the video. Returns True if view was counted."""
+    # Save bandwidth
+    if config.get("save_bandwidth", True):
+        save_bandwidth(driver)
 
-        bot_state["good_proxies"] += 1
-        add_log(f"Worker {position} | {'Direct(no proxy)' if is_direct else proxy} | 드라이버 시작")
+    play_video(driver)
 
-        background = config.get("headless", True)
-        driver = get_driver(background, agent, None if is_direct else proxy, proxy_type)
-
-        bot_state["workers"][position] = {"proxy": proxy, "status": "loading"}
-
-        # Spoof timezone
+    # Change playback speed
+    speed = config.get("playback_speed", 1)
+    if speed != 1:
         try:
-            if is_direct:
-                geo = requests.get("http://ip-api.com/json", timeout=10).json()
-            else:
-                proxy_dict = {"http": f"{proxy_type}://{proxy}", "https": f"{proxy_type}://{proxy}"}
-                geo = requests.get("http://ip-api.com/json", proxies=proxy_dict, timeout=10).json()
-            driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": geo.get("timezone", "UTC")})
-            driver.execute_cdp_cmd("Emulation.setGeolocationOverride", {
-                "latitude": geo.get("lat", 0),
-                "longitude": geo.get("lon", 0),
-                "accuracy": randint(20, 100),
-            })
+            driver.execute_script(f"document.querySelector('video').playbackRate = {speed};")
         except Exception:
             pass
 
-        url = config["url"]
+    # Get video duration
+    video_len = 0
+    for _ in range(20):
+        video_len = driver.execute_script(
+            "return document.getElementById('movie_player').getDuration()"
+        )
+        if video_len:
+            break
+        sleep(1)
 
-        # Navigate to video
-        driver.get(url)
-        sleep(3)
+    if not video_len:
+        raise Exception("Cannot get video duration")
 
-        # Bypass consent if redirected
-        if "consent" in driver.current_url:
-            bypass_consent(driver)
-            sleep(2)
-            if "consent" in driver.current_url:
-                # Fallback: navigate directly again
-                driver.get(url)
-                sleep(3)
+    title = driver.title.replace(" - YouTube", "")
+    min_pct = config.get("min_duration", 70) / 100
+    max_pct = config.get("max_duration", 95) / 100
+    watch_time = video_len * uniform(min_pct, max_pct)
+    duration_str = strftime("%Mm:%Ss", gmtime(watch_time))
 
-        # Wait for player with longer timeout
+    bot_state["workers"][position] = {
+        "proxy": proxy_label,
+        "status": "watching",
+        "title": title,
+        "duration": duration_str,
+    }
+
+    add_log(f"Worker {position} | {proxy_label} | {title} | {duration_str}")
+
+    # Watch loop
+    error_streak = 0
+    loop_count = int(watch_time / 5)
+    for _ in range(loop_count):
+        if cancel_flag.is_set():
+            break
+        sleep(5)
         try:
-            WebDriverWait(driver, 45).until(
-                EC.presence_of_element_located((By.ID, "movie_player"))
+            current_time = driver.execute_script(
+                "return document.getElementById('movie_player').getCurrentTime()"
             )
-            sleep(3)  # Extra settle time
-        except Exception:
-            page_title = driver.title
-            page_url = driver.current_url
-            raise Exception(f"비디오 플레이어 로드 실패 | title={page_title} | url={page_url}")
-
-        # Save bandwidth
-        if config.get("save_bandwidth", True):
-            save_bandwidth(driver)
-
-        play_video(driver)
-
-        # Change playback speed
-        speed = config.get("playback_speed", 1)
-        if speed != 1:
-            try:
-                driver.execute_script(
-                    f"document.querySelector('video').playbackRate = {speed};"
-                )
-            except Exception:
-                pass
-
-        # Get video duration
-        video_len = 0
-        for _ in range(30):
-            video_len = driver.execute_script(
-                "return document.getElementById('movie_player').getDuration()"
+            state = driver.execute_script(
+                "return document.getElementById('movie_player').getPlayerState()"
             )
-            if video_len:
+            if state in [-1, 0]:  # unstarted or ended
                 break
-            sleep(1)
-
-        if not video_len:
-            raise Exception("영상 길이를 가져올 수 없음")
-
-        title = driver.title.replace(" - YouTube", "")
-        min_pct = config.get("min_duration", 70) / 100
-        max_pct = config.get("max_duration", 95) / 100
-        watch_time = video_len * uniform(min_pct, max_pct)
-        duration_str = strftime("%Mm:%Ss", gmtime(watch_time))
-
-        bot_state["workers"][position] = {
-            "proxy": proxy,
-            "status": "watching",
-            "title": title,
-            "duration": duration_str,
-        }
-
-        add_log(f"Worker {position} | 시청 중: {title} | {duration_str}")
-
-        # Watch loop
-        loop_count = int(watch_time / 5)
-        for i in range(loop_count):
-            if cancel_flag.is_set():
+            if state == 2:  # paused
+                play_video(driver)
+            if state == 3:  # buffering
+                error_streak += 1
+                if error_streak > 6:
+                    raise Exception("Buffering too long")
+            else:
+                error_streak = 0
+            if current_time >= watch_time:
                 break
-            sleep(5)
-            try:
-                current_time = driver.execute_script(
-                    "return document.getElementById('movie_player').getCurrentTime()"
-                )
-                state = driver.execute_script(
-                    "return document.getElementById('movie_player').getPlayerState()"
-                )
-                if state in [-1, 0]:
-                    break
-                if state == 2:  # paused
-                    play_video(driver)
-                if current_time >= watch_time:
-                    break
-            except Exception:
+        except WebDriverException:
+            error_streak += 1
+            if error_streak > 4:
+                raise Exception("Player communication lost")
+
+    # Count view
+    bot_state["views"] += 1
+    title_short = title[:50]
+    bot_state["video_stats"][title_short] = bot_state["video_stats"].get(title_short, 0) + 1
+    add_log(f"Worker {position} | View #{bot_state['views']} OK", "success")
+    return True
+
+
+def worker_view(position, proxy, proxy_type, config):
+    """Worker with retry logic: tries up to MAX_RETRIES different proxies on failure."""
+    if cancel_flag.is_set():
+        return
+
+    is_direct = (proxy == "__direct__")
+    max_retries = 1 if is_direct else config.get("_max_retries", 3)
+    proxy_pool = config.get("_proxy_pool", [proxy])
+
+    for attempt in range(max_retries):
+        if cancel_flag.is_set():
+            return
+
+        # Pick proxy (rotate on retry)
+        if attempt > 0 and not is_direct:
+            available = [p for p in proxy_pool if not is_bad_proxy(p)]
+            if not available:
+                add_log(f"Worker {position} | No more proxies to try", "error")
                 break
+            proxy = choice(available)
 
-        # Count view
-        bot_state["views"] += 1
-        title_short = title[:50]
-        bot_state["video_stats"][title_short] = bot_state["video_stats"].get(title_short, 0) + 1
-        add_log(f"Worker {position} | 조회 완료! 총 {bot_state['views']}회", "success")
+        clean_proxy = proxy if is_direct else strip_proxy_prefix(proxy)
+        proxy_label = "Direct" if is_direct else clean_proxy
 
-    except Exception as e:
-        bot_state["errors"] += 1
-        add_log(f"Worker {position} | 오류: {e}", "error")
-    finally:
-        bot_state["workers"].pop(position, None)
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+        driver = None
+        try:
+            if not is_direct and is_bad_proxy(proxy):
+                continue
+
+            bot_state["good_proxies"] += 1
+            retry_tag = f" (retry {attempt})" if attempt > 0 else ""
+            add_log(f"Worker {position} | {proxy_label}{retry_tag} | Starting driver")
+
+            background = config.get("headless", True)
+            driver = get_driver(background, None, None if is_direct else clean_proxy, proxy_type)
+
+            bot_state["workers"][position] = {"proxy": proxy_label, "status": "loading"}
+
+            # Spoof timezone (skip on retry to save time)
+            if attempt == 0:
+                try:
+                    if is_direct:
+                        geo = requests.get("http://ip-api.com/json", timeout=8).json()
+                    else:
+                        pdict = {"http": f"{proxy_type}://{clean_proxy}", "https": f"{proxy_type}://{clean_proxy}"}
+                        geo = requests.get("http://ip-api.com/json", proxies=pdict, timeout=8).json()
+                    driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": geo.get("timezone", "UTC")})
+                    driver.execute_cdp_cmd("Emulation.setGeolocationOverride", {
+                        "latitude": geo.get("lat", 0),
+                        "longitude": geo.get("lon", 0),
+                        "accuracy": randint(20, 100),
+                    })
+                except Exception:
+                    pass
+
+            # Try loading video
+            if not _try_load_video(driver, config, position, proxy_label):
+                if not is_direct:
+                    mark_bad_proxy(proxy)
+                    bot_state["bad_proxies"] += 1
+                raise Exception("Video load failed")
+
+            # Watch video
+            _watch_video(driver, config, position, proxy_label)
+            return  # Success, exit retry loop
+
+        except Exception as e:
+            err_msg = str(e)
+            if len(err_msg) > 150:
+                err_msg = err_msg[:150] + "..."
+            if attempt == max_retries - 1:
+                bot_state["errors"] += 1
+                add_log(f"Worker {position} | FAIL after {attempt+1} tries: {err_msg}", "error")
+            else:
+                add_log(f"Worker {position} | Retry {attempt+1}: {err_msg}", "warn")
+        finally:
+            bot_state["workers"].pop(position, None)
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
 
 
 def run_bot(config):
@@ -446,13 +572,16 @@ def run_bot(config):
     bot_state["start_time"] = time.time()
     bot_state["target_views"] = config.get("target_views", 100)
 
+    # Clear bad proxy tracking from previous runs
+    with _bad_proxy_lock:
+        _bad_proxy_set.clear()
+
     add_log("봇 시작 - 프록시 수집 중...")
 
     proxy_type = config.get("proxy_type", "http")
     use_no_proxy = config.get("proxy_source") == "none"
 
     if use_no_proxy:
-        # No proxy mode - use local IP directly
         proxy_list = ["__direct__"]
         add_log("프록시 없이 로컬 IP로 직접 접속 모드")
     elif config.get("proxy_source") == "custom" and config.get("custom_proxies"):
@@ -464,7 +593,6 @@ def run_bot(config):
             add_log("프록시를 가져올 수 없습니다!", "error")
             bot_state["running"] = False
             return
-        # Pre-validate in parallel
         target_valid = max(config.get("target_views", 100) * 2, 20)
         proxy_list = pre_validate_proxies(raw_proxies, proxy_type, max_workers=50, target=min(target_valid, 100))
 
@@ -473,43 +601,67 @@ def run_bot(config):
         bot_state["running"] = False
         return
 
+    # Pass full proxy pool and retry config to workers
+    config["_proxy_pool"] = proxy_list
+    config["_max_retries"] = 3
+
     target = config.get("target_views", 100)
     max_threads = config.get("threads", 3)
     if use_no_proxy:
-        max_threads = 1  # Only 1 thread without proxy
+        max_threads = 1
 
     add_log(f"목표: {target}회 | 스레드: {max_threads} | 프록시: {'없음(직접)' if use_no_proxy else f'{len(proxy_list)}개'}")
 
+    refetch_count = 0
     position = 0
     while bot_state["views"] < target and not cancel_flag.is_set():
-        batch_size = min(max_threads, target - bot_state["views"])
+        # Filter out known-bad proxies for batch selection
         if not use_no_proxy:
-            batch_size = min(batch_size, len(proxy_list))
+            available = [p for p in proxy_list if not is_bad_proxy(p)]
+            if len(available) < max_threads:
+                add_log(f"사용 가능한 프록시 부족 ({len(available)}개) - 새 프록시 수집 중...", "warn")
+                refetch_count += 1
+                if refetch_count > 3:
+                    add_log("프록시 재수집 한도 초과, 종료합니다", "error")
+                    break
+                raw_proxies = fetch_free_proxies(proxy_type)
+                if raw_proxies:
+                    new_proxies = pre_validate_proxies(raw_proxies, proxy_type, max_workers=50, target=50)
+                    proxy_list.extend(new_proxies)
+                    config["_proxy_pool"] = proxy_list
+                    add_log(f"새 프록시 {len(new_proxies)}개 추가 (총 {len(proxy_list)}개)")
+                available = [p for p in proxy_list if not is_bad_proxy(p)]
+                if not available:
+                    add_log("유효한 프록시가 모두 소진되었습니다", "error")
+                    break
+        else:
+            available = proxy_list
+
+        batch_size = min(max_threads, target - bot_state["views"], len(available))
         if batch_size <= 0:
-            if use_no_proxy:
-                break
-            proxy_list = fetch_free_proxies(proxy_type)
-            if not proxy_list:
-                break
-            continue
+            break
 
         batch_proxies = []
         for _ in range(batch_size):
-            batch_proxies.append(choice(proxy_list))
+            batch_proxies.append(choice(available))
 
-        with ThreadPoolExecutor(max_workers=batch_size) as executor:
-            futures = []
-            for i, proxy in enumerate(batch_proxies):
-                pos = position + i
-                futures.append(executor.submit(worker_view, pos, proxy, proxy_type, config))
-            wait(futures)
+        # Use raw threads instead of ThreadPoolExecutor (Windows compat)
+        threads = []
+        for i, proxy in enumerate(batch_proxies):
+            pos = position + i
+            t = threading.Thread(target=worker_view, args=(pos, proxy, proxy_type, config))
+            t.daemon = True
+            t.start()
+            threads.append(t)
+
+        for t in threads:
+            t.join(timeout=300)
 
         position += batch_size
 
         if bot_state["views"] >= target:
             break
 
-        # Small delay between batches
         sleep(2)
 
     add_log(f"봇 종료 - 총 조회수: {bot_state['views']}", "success")
