@@ -444,6 +444,19 @@
                         <option value="2">2x</option>
                     </select>
                 </div>
+                <div class="form-group">
+                    <label>Traffic Source</label>
+                    <select id="trafficSource">
+                        <option value="mixed">Mixed (Recommended)</option>
+                        <option value="direct">Direct URL Only</option>
+                        <option value="search">YouTube Search</option>
+                        <option value="external">External Referrer</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Shorts Loops (per tab)</label>
+                    <input type="number" id="shortsLoops" value="3" min="1" max="10" />
+                </div>
                 <div class="checkbox-group">
                     <input type="checkbox" id="headless" checked />
                     <label for="headless">Headless</label>
@@ -609,7 +622,7 @@
                     document.getElementById('previewViews').textContent = d.view_count ? `Views: ${d.view_count}` : '';
                     document.getElementById('previewId').textContent = `ID: ${d.video_id}`;
                     document.getElementById('previewBadge').className = 'valid-badge ok';
-                    document.getElementById('previewBadge').textContent = 'VALID';
+                    document.getElementById('previewBadge').textContent = d.is_shorts ? 'SHORTS' : 'VALID';
                     previewViewsBefore = d.view_count ? parseInt(d.view_count.replace(/,/g, '')) : null;
                 } else {
                     document.getElementById('previewThumb').src = '';
@@ -653,6 +666,8 @@
                 min_duration: document.getElementById('minDuration').value,
                 max_duration: document.getElementById('maxDuration').value,
                 playback_speed: document.getElementById('playbackSpeed').value,
+                traffic_source: document.getElementById('trafficSource').value,
+                shorts_loops: document.getElementById('shortsLoops').value,
                 headless: document.getElementById('headless').checked,
                 save_bandwidth: document.getElementById('saveBandwidth').checked,
             };

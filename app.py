@@ -1,23 +1,25 @@
 """
 YouTube View Web — 웹 대시보드 기반 YouTube 뷰어 봇
-nodriver (CDP) 기반 — chromedriver 불필요, RAM 대폭 절감
+zendriver (CDP) + 핑거프린트 스푸핑 + 트래픽 소스 다양화 + Shorts 지원
 """
 import asyncio
 import io
 import json
+import math
 import os
+import re
 import sys
 import threading
 import time
 from datetime import datetime
-from random import choice, randint, uniform
+from random import choice, gauss, randint, random, sample, shuffle, uniform
 from time import gmtime, sleep, strftime
 
-import nodriver as uc
+import zendriver as uc
 import requests
 from flask import Flask, jsonify, render_template, request
 
-# Fix Windows cp949 encoding crash (emoji/unicode in nodriver output)
+# Fix Windows cp949 encoding crash (emoji/unicode in zendriver output)
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
@@ -58,7 +60,6 @@ def add_log(msg, level="info"):
 # ── Proxy Fetcher ──
 PROXY_SOURCES = {
     "http": [
-        # === GitHub raw lists (auto-updated) ===
         "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
         "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
         "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
@@ -70,7 +71,6 @@ PROXY_SOURCES = {
         "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/main/proxies/http.txt",
         "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS.txt",
         "https://raw.githubusercontent.com/shiftytr/proxy-list/master/proxy.txt",
-        # === API endpoints ===
         "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
     ],
     "socks4": [
@@ -109,7 +109,6 @@ def fetch_free_proxies(proxy_type="http"):
                 for line in resp.text.strip().split("\n"):
                     line = line.strip()
                     if line and ":" in line and not line.startswith("#"):
-                        # Strip protocol prefix if present
                         clean = strip_proxy_prefix(line)
                         if clean and ":" in clean:
                             found.add(clean)
@@ -119,7 +118,6 @@ def fetch_free_proxies(proxy_type="http"):
         except Exception:
             pass
 
-    # Fetch all sources in parallel
     threads = []
     for url in sources:
         t = threading.Thread(target=_fetch_one, args=(url,), daemon=True)
@@ -129,7 +127,6 @@ def fetch_free_proxies(proxy_type="http"):
     for t in threads:
         t.join(timeout=20)
 
-    # Log results
     for src, cnt in sorted(source_results, key=lambda x: -x[1]):
         add_log(f"  {src}: {cnt}개", "info")
     add_log(f"무료 {proxy_type} 프록시 {len(proxies)}개 수집 완료 ({len(source_results)}/{len(sources)} 소스)")
@@ -137,15 +134,16 @@ def fetch_free_proxies(proxy_type="http"):
 
 
 def strip_proxy_prefix(proxy):
-    """Remove protocol prefix from proxy string."""
     for prefix in ["http://", "https://", "socks5://", "socks4://"]:
         if proxy.startswith(prefix):
             return proxy[len(prefix):]
     return proxy
 
 
+CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.178 Safari/537.36"
+
+
 def check_proxy_youtube(proxy, proxy_type="http", timeout=8):
-    """Validate proxy by actually hitting YouTube (more reliable than ip-api)."""
     try:
         clean = strip_proxy_prefix(proxy)
         proxy_dict = {
@@ -154,8 +152,7 @@ def check_proxy_youtube(proxy, proxy_type="http", timeout=8):
         }
         resp = requests.get(
             "https://www.youtube.com/robots.txt",
-            proxies=proxy_dict,
-            timeout=timeout,
+            proxies=proxy_dict, timeout=timeout,
             headers={"User-Agent": CHROME_UA},
         )
         return resp.status_code == 200 and "Disallow" in resp.text
@@ -163,8 +160,6 @@ def check_proxy_youtube(proxy, proxy_type="http", timeout=8):
         return False
 
 
-
-# Shared bad proxy set to avoid reuse across batches
 _bad_proxy_set = set()
 _bad_proxy_lock = threading.Lock()
 
@@ -180,21 +175,18 @@ def is_bad_proxy(proxy):
 
 
 def pre_validate_proxies(proxy_list, proxy_type="http", max_workers=150, target=30):
-    """Direct YouTube reachability validation with high concurrency.
-    Prioritizes accuracy over speed — tests proxies directly against YouTube."""
-    import random
+    import random as _rand
     final_valid = []
     lock = threading.Lock()
     done_event = threading.Event()
 
-    # ~1% pass rate observed, so sample target * 150 to be safe
     needed_samples = min(len(proxy_list), max(target * 150, 3000))
-    sample = random.sample(proxy_list, needed_samples)
+    sample_list = _rand.sample(proxy_list, needed_samples)
 
-    add_log(f"프록시 검증 시작 (후보 {len(proxy_list)}개, 테스트 {len(sample)}개, 목표 {target}개)...")
+    add_log(f"프록시 검증 시작 (후보 {len(proxy_list)}개, 테스트 {len(sample_list)}개, 목표 {target}개)...")
     add_log(f"YouTube 직접 검증 (동시 {max_workers} 스레드)...")
 
-    tested = [0]  # mutable counter
+    tested = [0]
 
     def _yt_check(proxy):
         if done_event.is_set() or cancel_flag.is_set():
@@ -207,12 +199,11 @@ def pre_validate_proxies(proxy_list, proxy_type="http", max_workers=150, target=
                     done_event.set()
         with lock:
             tested[0] += 1
-            # Progress update every 500 proxies
             if tested[0] % 500 == 0:
-                add_log(f"  검증 진행: {tested[0]}/{len(sample)} 테스트, {len(final_valid)}개 유효")
+                add_log(f"  검증 진행: {tested[0]}/{len(sample_list)} 테스트, {len(final_valid)}개 유효")
 
     threads_list = []
-    for p in sample:
+    for p in sample_list:
         if done_event.is_set() or cancel_flag.is_set():
             break
         t = threading.Thread(target=_yt_check, args=(p,), daemon=True)
@@ -221,7 +212,6 @@ def pre_validate_proxies(proxy_list, proxy_type="http", max_workers=150, target=
         while sum(1 for t in threads_list if t.is_alive()) >= max_workers:
             sleep(0.01)
 
-    # Allow enough time: 12s timeout * 2 buffer
     deadline = time.time() + 180
     for t in threads_list:
         if done_event.is_set():
@@ -232,24 +222,151 @@ def pre_validate_proxies(proxy_list, proxy_type="http", max_workers=150, target=
             break
 
     add_log(
-        f"검증 완료: {len(final_valid)}개 YouTube 유효 프록시 (테스트 {tested[0]}/{len(sample)})",
+        f"검증 완료: {len(final_valid)}개 YouTube 유효 프록시 (테스트 {tested[0]}/{len(sample_list)})",
         "success" if final_valid else "error",
     )
     return final_valid
 
 
-# ── nodriver (CDP) Browser ──
+# ── zendriver (CDP) Browser ──
 VIEWPORTS = [
     (2560, 1440), (1920, 1080), (1440, 900),
     (1536, 864), (1366, 768), (1280, 1024), (1024, 768),
 ]
 
-CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.178 Safari/537.36"
+# Mobile UAs for Shorts
+MOBILE_UAS = [
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.178 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.178 Mobile Safari/537.36",
+]
+
+# External referrers for traffic source diversity
+EXTERNAL_REFERRERS = [
+    "https://www.google.com/search?q=",
+    "https://www.bing.com/search?q=",
+    "https://search.yahoo.com/search?p=",
+    "https://duckduckgo.com/?q=",
+    "https://t.co/redirect?url=",
+]
+
+SEARCH_KEYWORDS = [
+    "music video", "tutorial", "review", "funny moments", "vlog",
+    "how to", "best of", "gameplay", "reaction", "documentary",
+]
 
 
-async def start_browser(headless=True, proxy=None, proxy_type="http"):
-    """Start a nodriver browser with optimized flags. No chromedriver needed."""
-    vp = choice(VIEWPORTS)
+# ── Fingerprint Spoofing JS ──
+FINGERPRINT_SPOOF_JS = '''
+(() => {
+    // Canvas fingerprint randomization
+    const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+    HTMLCanvasElement.prototype.toDataURL = function(type) {
+        const ctx = this.getContext('2d');
+        if (ctx) {
+            const imgData = ctx.getImageData(0, 0, this.width, this.height);
+            for (let i = 0; i < Math.min(imgData.data.length, 20); i += 4) {
+                imgData.data[i] = imgData.data[i] ^ __CANVAS_SEED__;
+            }
+            ctx.putImageData(imgData, 0, 0);
+        }
+        return origToDataURL.apply(this, arguments);
+    };
+
+    // WebGL vendor/renderer spoofing
+    const getParam = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(param) {
+        if (param === 37445) return 'Google Inc. (NVIDIA)';
+        if (param === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX __GPU_MODEL__ Direct3D11 vs_5_0 ps_5_0)';
+        return getParam.apply(this, arguments);
+    };
+
+    // WebRTC IP leak prevention
+    if (window.RTCPeerConnection) {
+        const origRTC = window.RTCPeerConnection;
+        window.RTCPeerConnection = function(...args) {
+            if (args[0] && args[0].iceServers) {
+                args[0].iceServers = [];
+            }
+            return new origRTC(...args);
+        };
+        window.RTCPeerConnection.prototype = origRTC.prototype;
+    }
+
+    // AudioContext fingerprint defense
+    const origGetFloatFreqData = AnalyserNode.prototype.getFloatFrequencyData;
+    AnalyserNode.prototype.getFloatFrequencyData = function(array) {
+        origGetFloatFreqData.apply(this, arguments);
+        for (let i = 0; i < Math.min(array.length, 10); i++) {
+            array[i] = array[i] + (__AUDIO_SEED__ * 0.00001);
+        }
+    };
+
+    // Navigator properties
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => __HW_CONCURRENCY__ });
+    Object.defineProperty(navigator, 'deviceMemory', { get: () => __DEV_MEMORY__ });
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+})();
+'''
+
+GPU_MODELS = ["1060", "1070", "1080", "2060", "2070", "2080", "3060", "3070", "3080", "4060", "4070", "4080"]
+
+
+def _make_fingerprint_js():
+    """Generate unique fingerprint spoof JS per session."""
+    js = FINGERPRINT_SPOOF_JS
+    js = js.replace("__CANVAS_SEED__", str(randint(1, 255)))
+    js = js.replace("__GPU_MODEL__", choice(GPU_MODELS))
+    js = js.replace("__AUDIO_SEED__", str(randint(-50, 50)))
+    js = js.replace("__HW_CONCURRENCY__", str(choice([2, 4, 8, 12, 16])))
+    js = js.replace("__DEV_MEMORY__", str(choice([2, 4, 8, 16])))
+    return js
+
+
+# ── Human Behavior Simulation JS ──
+HUMAN_BEHAVIOR_JS = '''
+(() => {
+    // Random scroll to comments area
+    const scrollTarget = Math.random() * 800 + 200;
+    window.scrollTo({ top: scrollTarget, behavior: 'smooth' });
+
+    setTimeout(() => {
+        // Scroll back up
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+    }, __SCROLL_BACK_DELAY__);
+})();
+'''
+
+
+async def _simulate_human(page):
+    """Simulate human-like interactions during video watch."""
+    actions = ["scroll", "nothing", "nothing", "scroll_comments"]
+    action = choice(actions)
+
+    if action == "scroll":
+        scroll_y = randint(100, 500)
+        await page.evaluate(f"window.scrollTo({{top: {scroll_y}, behavior: 'smooth'}})")
+        await page.sleep(_gaussian_delay(2, 0.5))
+        await page.evaluate("window.scrollTo({top: 0, behavior: 'smooth'})")
+    elif action == "scroll_comments":
+        js = HUMAN_BEHAVIOR_JS.replace("__SCROLL_BACK_DELAY__", str(randint(2000, 5000)))
+        await page.evaluate(js)
+
+
+def _gaussian_delay(mean, stddev):
+    """Return a gaussian-distributed delay (clamped to positive)."""
+    return max(0.5, gauss(mean, stddev))
+
+
+async def start_browser(headless=True, proxy=None, proxy_type="http", is_shorts=False):
+    """Start a zendriver browser with optimized flags + anti-detect."""
+    if is_shorts:
+        vp = choice([(412, 915), (390, 844), (414, 896)])
+        ua = choice(MOBILE_UAS)
+    else:
+        vp = choice(VIEWPORTS)
+        ua = CHROME_UA
+
     args = [
         f"--window-size={vp[0]},{vp[1]}",
         "--no-sandbox",
@@ -263,7 +380,10 @@ async def start_browser(headless=True, proxy=None, proxy_type="http"):
         "--disable-background-timer-throttling",
         "--disable-renderer-backgrounding",
         "--disable-backgrounding-occluded-windows",
-        f"--user-agent={CHROME_UA}",
+        "--disable-webrtc-hw-encoding",
+        "--disable-webrtc-hw-decoding",
+        "--enforce-webrtc-ip-permission-check",
+        f"--user-agent={ua}",
     ]
     if proxy:
         args.append(f"--proxy-server={proxy_type}://{proxy}")
@@ -272,12 +392,142 @@ async def start_browser(headless=True, proxy=None, proxy_type="http"):
     return browser
 
 
-async def _try_load_video_async(page, browser, config, position, proxy_label):
-    """Navigate to YouTube video and wait for player. Returns True on success."""
-    url = config["url"]
+def _detect_content_type(url):
+    """Detect if URL is Shorts or regular video."""
+    if "/shorts/" in url:
+        return "shorts"
+    return "video"
 
+
+def _extract_video_id(url):
+    m = re.search(r"(?:v=|youtu\.be/|shorts/)([0-9A-Za-z_-]{11})", url)
+    return m.group(1) if m else None
+
+
+def _build_navigation_url(url, traffic_source, video_id):
+    """Build URL based on traffic source mode."""
+    if traffic_source == "direct":
+        return url
+    elif traffic_source == "external":
+        referrer = choice(EXTERNAL_REFERRERS)
+        return url  # We'll set the referrer header instead
+    elif traffic_source == "search":
+        return "https://www.youtube.com"  # We'll search then click
+    return url
+
+
+async def _navigate_via_search(page, browser, video_id, position, proxy_label):
+    """Navigate to video via YouTube search (mimics organic discovery)."""
+    try:
+        page = await browser.get("https://www.youtube.com")
+        await page.sleep(_gaussian_delay(3, 0.8))
+
+        # Type in search box
+        search_box = await page.query_selector('input#search, input[name="search_query"]')
+        if not search_box:
+            add_log(f"Worker {position} | Search box not found, falling back to direct", "warn")
+            return None
+
+        # Type keyword + video ID (to find our specific video)
+        keyword = choice(SEARCH_KEYWORDS)
+        search_query = f"{keyword} {video_id}"
+
+        await search_box.click()
+        await page.sleep(_gaussian_delay(0.5, 0.2))
+
+        # Type letter by letter with random delays
+        for ch in search_query:
+            await page.evaluate(f'''
+                document.querySelector('input#search, input[name="search_query"]').value += '{ch}';
+                document.querySelector('input#search, input[name="search_query"]').dispatchEvent(new Event('input', {{bubbles: true}}));
+            ''')
+            await page.sleep(uniform(0.05, 0.2))
+
+        await page.sleep(_gaussian_delay(0.8, 0.3))
+
+        # Press Enter to search
+        await page.evaluate('''
+            document.querySelector('form#search-form, form[action="/results"]').submit();
+        ''')
+        await page.sleep(_gaussian_delay(4, 1))
+
+        # Try to find and click our video in results
+        clicked = await page.evaluate(f'''
+            (() => {{
+                const links = document.querySelectorAll('a#video-title, ytd-video-renderer a');
+                for (const link of links) {{
+                    if (link.href && link.href.includes('{video_id}')) {{
+                        link.click();
+                        return true;
+                    }}
+                }}
+                return false;
+            }})()
+        ''')
+
+        if clicked:
+            await page.sleep(_gaussian_delay(4, 1))
+            return page
+        else:
+            add_log(f"Worker {position} | Video not found in search, direct fallback", "warn")
+            return None
+
+    except Exception as e:
+        add_log(f"Worker {position} | Search navigation failed: {str(e)[:60]}", "warn")
+        return None
+
+
+async def _navigate_via_external(page, browser, url, position):
+    """Navigate with external referrer (simulates clicking from Google/social)."""
+    referrer = choice(EXTERNAL_REFERRERS)
+    # Set referrer via CDP
+    try:
+        await page.evaluate(f'''
+            Object.defineProperty(document, 'referrer', {{
+                get: () => '{referrer}'
+            }});
+        ''')
+    except Exception:
+        pass
     page = await browser.get(url)
-    await page.sleep(4)
+    return page
+
+
+async def _try_load_video_async(page, browser, config, position, proxy_label):
+    """Navigate to YouTube video with traffic source diversity."""
+    url = config["url"]
+    traffic_source = config.get("traffic_source", "mixed")
+    video_id = _extract_video_id(url)
+    content_type = config.get("_content_type", "video")
+
+    # Pick traffic source for this attempt
+    if traffic_source == "mixed":
+        source = choice(["direct", "direct", "external", "search"])
+    else:
+        source = traffic_source
+
+    # Inject fingerprint spoofing
+    fp_js = _make_fingerprint_js()
+    try:
+        first_page = await browser.get("about:blank")
+        await first_page.evaluate(fp_js)
+    except Exception:
+        pass
+
+    # Navigate based on source
+    if source == "search" and video_id and content_type != "shorts":
+        result = await _navigate_via_search(page, browser, video_id, position, proxy_label)
+        if result:
+            page = result
+        else:
+            source = "direct"  # fallback
+
+    if source == "external":
+        page = await _navigate_via_external(page, browser, url, position)
+        await page.sleep(_gaussian_delay(4, 1))
+    elif source == "direct" or (source == "search" and content_type == "shorts"):
+        page = await browser.get(url)
+        await page.sleep(_gaussian_delay(4, 1))
 
     # Handle supported_browsers redirect
     cur_url = page.url or ""
@@ -289,7 +539,6 @@ async def _try_load_video_async(page, browser, config, position, proxy_label):
 
     # Handle consent redirect
     if "consent" in cur_url:
-        # Try clicking accept button via JS
         await page.evaluate('''
             (() => {
                 const btns = document.querySelectorAll('button[aria-label*="Accept"], button[aria-label*="agree"], #yDmH0d button');
@@ -303,25 +552,89 @@ async def _try_load_video_async(page, browser, config, position, proxy_label):
             page = await browser.get(url)
             await page.sleep(4)
 
-    # Wait for player (poll up to 40s)
-    for _ in range(20):
-        has_player = await page.evaluate('!!document.getElementById("movie_player")')
-        if has_player:
-            await page.sleep(3)
-            return page
-        await page.sleep(2)
+    # For Shorts, check for shorts player
+    if content_type == "shorts":
+        for _ in range(15):
+            has_shorts = await page.evaluate('''
+                !!document.querySelector('ytd-shorts, ytd-reel-video-renderer, #shorts-player, video')
+            ''')
+            if has_shorts:
+                await page.sleep(2)
+                add_log(f"Worker {position} | {proxy_label} | Shorts loaded [src={source}]")
+                return page
+            await page.sleep(2)
+    else:
+        # Regular video: wait for player
+        for _ in range(20):
+            has_player = await page.evaluate('!!document.getElementById("movie_player")')
+            if has_player:
+                await page.sleep(3)
+                add_log(f"Worker {position} | {proxy_label} | Player loaded [src={source}]")
+                return page
+            await page.sleep(2)
 
     cur_url = page.url or ""
     if "supported_browsers" in cur_url:
         add_log(f"Worker {position} | {proxy_label} | YouTube blocked (unsupported browser)", "warn")
     else:
-        add_log(f"Worker {position} | {proxy_label} | Player load failed | url={cur_url[:80]}", "warn")
+        add_log(f"Worker {position} | {proxy_label} | Load failed | url={cur_url[:80]}", "warn")
     return None
 
 
+async def _watch_shorts_async(page, config, position, proxy_label):
+    """Watch a YouTube Short. Each play/replay = 1 view (no min watch time)."""
+    loops = config.get("shorts_loops", 3)
+
+    # Ensure video is playing
+    await page.evaluate('''
+        (() => {
+            const v = document.querySelector('video');
+            if (v) { v.play(); v.muted = true; }
+        })()
+    ''')
+    await page.sleep(2)
+
+    raw_title = await page.evaluate("document.title")
+    title = (raw_title or "").replace(" - YouTube", "")
+
+    bot_state["workers"][position] = {
+        "proxy": proxy_label,
+        "status": f"shorts x{loops}",
+        "title": title[:60],
+    }
+
+    for loop_i in range(loops):
+        if cancel_flag.is_set():
+            break
+
+        # Wait for video to finish or watch 3-15 seconds
+        watch_sec = uniform(3, 15)
+        await page.sleep(watch_sec)
+
+        # Replay by seeking to 0
+        await page.evaluate('''
+            (() => {
+                const v = document.querySelector('video');
+                if (v) { v.currentTime = 0; v.play(); }
+            })()
+        ''')
+
+        # Count each loop as a view
+        bot_state["views"] += 1
+        title_short = title[:50]
+        bot_state["video_stats"][title_short] = bot_state["video_stats"].get(title_short, 0) + 1
+        add_log(f"Worker {position} | Shorts view #{bot_state['views']} (loop {loop_i+1}/{loops})", "success")
+
+        # Human behavior between loops
+        if loop_i < loops - 1:
+            await page.sleep(_gaussian_delay(1.5, 0.5))
+
+    return True
+
+
 async def _watch_video_async(page, config, position, proxy_label):
-    """Play and watch the video via CDP. Returns True if view was counted."""
-    # Set lowest quality via JS
+    """Play and watch regular video via CDP."""
+    # Set lowest quality
     if config.get("save_bandwidth", True):
         await page.evaluate('''
             (() => {
@@ -341,12 +654,11 @@ async def _watch_video_async(page, config, position, proxy_label):
         })()
     ''')
 
-    # Change playback speed
     speed = config.get("playback_speed", 1)
     if speed != 1:
         await page.evaluate(f"try {{ document.querySelector('video').playbackRate = {speed}; }} catch(e) {{}}")
 
-    # Get video duration (retry up to 20 times)
+    # Get video duration
     video_len = 0
     for _ in range(20):
         video_len = await page.evaluate(
@@ -367,21 +679,19 @@ async def _watch_video_async(page, config, position, proxy_label):
     duration_str = strftime("%Mm:%Ss", gmtime(watch_time))
 
     bot_state["workers"][position] = {
-        "proxy": proxy_label,
-        "status": "watching",
-        "title": title[:60],
-        "duration": duration_str,
+        "proxy": proxy_label, "status": "watching",
+        "title": title[:60], "duration": duration_str,
     }
-
     add_log(f"Worker {position} | {proxy_label} | {title[:50]} | {duration_str}")
 
-    # Watch loop
+    # Watch loop with human behavior
     error_streak = 0
     loop_count = int(watch_time / 5)
+    human_action_counter = 0
     for _ in range(loop_count):
         if cancel_flag.is_set():
             break
-        await page.sleep(5)
+        await page.sleep(_gaussian_delay(5, 0.8))
         try:
             result = await page.evaluate('''
                 (() => {
@@ -400,7 +710,7 @@ async def _watch_video_async(page, config, position, proxy_label):
             state = result.get("s", -99)
             current_time = result.get("t", 0)
 
-            if state in [-1, 0]:  # unstarted or ended
+            if state in [-1, 0]:
                 break
             if state == 2:  # paused
                 await page.evaluate("try { document.getElementById('movie_player').playVideo(); } catch(e) {}")
@@ -412,6 +722,12 @@ async def _watch_video_async(page, config, position, proxy_label):
                 error_streak = 0
             if current_time >= watch_time:
                 break
+
+            # Periodic human-like actions
+            human_action_counter += 1
+            if human_action_counter % randint(4, 8) == 0:
+                await _simulate_human(page)
+
         except Exception as e:
             if "communication lost" in str(e) or "Buffering" in str(e):
                 raise
@@ -419,7 +735,6 @@ async def _watch_video_async(page, config, position, proxy_label):
             if error_streak > 4:
                 raise Exception("Player communication lost")
 
-    # Count view
     bot_state["views"] += 1
     title_short = title[:50]
     bot_state["video_stats"][title_short] = bot_state["video_stats"].get(title_short, 0) + 1
@@ -428,17 +743,18 @@ async def _watch_video_async(page, config, position, proxy_label):
 
 
 async def _worker_multitab_async(position, proxy, proxy_type, config):
-    """Async multitab worker using nodriver (CDP). One Chrome, multiple views."""
+    """Async multitab worker using zendriver (CDP) + all enhancements."""
     is_direct = (proxy == "__direct__")
     proxy_pool = config.get("_proxy_pool", [proxy])
     max_retries = 1 if is_direct else 3
     views_per_session = config.get("_views_per_session", 5)
+    content_type = config.get("_content_type", "video")
+    is_shorts = content_type == "shorts"
 
     for attempt in range(max_retries):
         if cancel_flag.is_set():
             return
 
-        # Rotate proxy on retry
         if attempt > 0 and not is_direct:
             available = [p for p in proxy_pool if not is_bad_proxy(p)]
             if not available:
@@ -455,17 +771,17 @@ async def _worker_multitab_async(position, proxy, proxy_type, config):
         try:
             bot_state["good_proxies"] += 1
             retry_tag = f" (retry {attempt})" if attempt > 0 else ""
-            add_log(f"Worker {position} | {proxy_label}{retry_tag} | Starting (nodriver x{views_per_session})")
+            mode_tag = "shorts" if is_shorts else "video"
+            add_log(f"Worker {position} | {proxy_label}{retry_tag} | Starting ({mode_tag} x{views_per_session})")
 
             headless = config.get("headless", True)
-            browser = await start_browser(headless, None if is_direct else clean_proxy, proxy_type)
+            browser = await start_browser(headless, None if is_direct else clean_proxy, proxy_type, is_shorts)
 
             bot_state["workers"][position] = {"proxy": proxy_label, "status": "loading"}
 
-            # Get initial page
             page = await browser.get("about:blank")
 
-            # First tab: if this fails, retry with different proxy
+            # First tab
             page = await _try_load_video_async(page, browser, config, position, proxy_label)
             if not page:
                 if not is_direct:
@@ -473,11 +789,14 @@ async def _worker_multitab_async(position, proxy, proxy_type, config):
                     bot_state["bad_proxies"] += 1
                 raise Exception("Video load failed")
 
-            # First tab succeeded - watch it
-            await _watch_video_async(page, config, position, proxy_label)
+            # Watch based on content type
+            if is_shorts:
+                await _watch_shorts_async(page, config, position, proxy_label)
+            else:
+                await _watch_video_async(page, config, position, proxy_label)
             session_views = 1
 
-            # Continue with more tabs in the same Chrome
+            # Continue with more tabs
             for tab_i in range(1, views_per_session):
                 if cancel_flag.is_set() or bot_state["views"] >= config.get("target_views", 100):
                     break
@@ -485,11 +804,9 @@ async def _worker_multitab_async(position, proxy, proxy_type, config):
                 bot_state["workers"][position] = {"proxy": proxy_label, "status": f"tab {tab_i+1}/{views_per_session}"}
 
                 try:
-                    # Open new tab via browser.get with new_tab=True
                     new_page = await browser.get(config["url"], new_tab=True)
-                    await new_page.sleep(4)
+                    await new_page.sleep(_gaussian_delay(4, 1))
 
-                    # Check player on new tab
                     loaded_page = await _try_load_video_async(new_page, browser, config, position, proxy_label)
                     if not loaded_page:
                         add_log(f"Worker {position} | Tab {tab_i+1} load failed, skipping", "warn")
@@ -499,22 +816,24 @@ async def _worker_multitab_async(position, proxy, proxy_type, config):
                             pass
                         continue
 
-                    await _watch_video_async(loaded_page, config, position, proxy_label)
+                    if is_shorts:
+                        await _watch_shorts_async(loaded_page, config, position, proxy_label)
+                    else:
+                        await _watch_video_async(loaded_page, config, position, proxy_label)
                     session_views += 1
 
-                    # Close tab
                     try:
                         await loaded_page.close()
                     except Exception:
                         pass
 
-                    await asyncio.sleep(uniform(1, 3))
+                    await asyncio.sleep(_gaussian_delay(2, 0.5))
 
                 except Exception as e:
                     add_log(f"Worker {position} | Tab {tab_i+1} error: {str(e)[:80]}", "warn")
 
             add_log(f"Worker {position} | Session done: {session_views} views from {proxy_label}", "success")
-            return  # Success
+            return
 
         except Exception as e:
             err_msg = str(e)[:150]
@@ -533,7 +852,7 @@ async def _worker_multitab_async(position, proxy, proxy_type, config):
 
 
 def worker_multitab(position, proxy, proxy_type, config):
-    """Thread-safe wrapper: runs async nodriver worker in its own event loop."""
+    """Thread-safe wrapper: runs async zendriver worker in its own event loop."""
     loop = asyncio.new_event_loop()
     try:
         loop.run_until_complete(_worker_multitab_async(position, proxy, proxy_type, config))
@@ -554,11 +873,14 @@ def run_bot(config):
     bot_state["start_time"] = time.time()
     bot_state["target_views"] = config.get("target_views", 100)
 
-    # Clear bad proxy tracking from previous runs
     with _bad_proxy_lock:
         _bad_proxy_set.clear()
 
-    add_log("봇 시작 - 프록시 수집 중...")
+    # Detect content type
+    content_type = _detect_content_type(config["url"])
+    config["_content_type"] = content_type
+
+    add_log(f"봇 시작 - 모드: {content_type.upper()} | zendriver + 핑거프린트 스푸핑")
 
     proxy_type = config.get("proxy_type", "http")
     use_no_proxy = config.get("proxy_source") == "none"
@@ -575,7 +897,6 @@ def run_bot(config):
             add_log("프록시를 가져올 수 없습니다!", "error")
             bot_state["running"] = False
             return
-        # Scale validated proxy target: at least 2x threads, cap 200
         target_valid = min(max(config.get("threads", 5) * 4, config.get("target_views", 100), 30), 200)
         proxy_list = pre_validate_proxies(raw_proxies, proxy_type, max_workers=150, target=target_valid)
 
@@ -584,27 +905,30 @@ def run_bot(config):
         bot_state["running"] = False
         return
 
-    # Pass full proxy pool and retry config to workers
     config["_proxy_pool"] = proxy_list
     config["_max_retries"] = 3
-    config["_views_per_session"] = 5  # views per Chrome instance (multitab)
+
+    # Shorts get more views per session (faster per view)
+    if content_type == "shorts":
+        config["_views_per_session"] = config.get("shorts_loops", 3)
+    else:
+        config["_views_per_session"] = 5
 
     target = config.get("target_views", 100)
     max_threads = config.get("threads", 5)
     if use_no_proxy:
         max_threads = 1
 
-    # Estimate completion time
-    bot_state["eta"] = _estimate_eta(target, max_threads, use_no_proxy, len(proxy_list))
+    traffic_src = config.get("traffic_source", "mixed")
+    bot_state["eta"] = _estimate_eta(target, max_threads, use_no_proxy, len(proxy_list), content_type)
     add_log(f"목표: {target}회 | 스레드: {max_threads} | 프록시: {'없음(직접)' if use_no_proxy else f'{len(proxy_list)}개'}")
-    add_log(f"멀티탭 모드: Chrome당 {config['_views_per_session']}회 시청 (RAM 절약)")
+    add_log(f"트래픽 소스: {traffic_src} | 핑거프린트: ON | 인간 행동: ON")
     add_log(f"예상 소요 시간: {bot_state['eta']}")
 
     refetch_count = 0
     position = 0
     batch_num = 0
     while bot_state["views"] < target and not cancel_flag.is_set():
-        # Filter out known-bad proxies for batch selection
         if not use_no_proxy:
             available = [p for p in proxy_list if not is_bad_proxy(p)]
             if len(available) < max_threads:
@@ -633,7 +957,6 @@ def run_bot(config):
         batch_proxies = []
         used_set = set()
         for _ in range(batch_size):
-            # Try to pick unique proxies for each worker in batch
             candidates = [p for p in available if p not in used_set]
             if not candidates:
                 candidates = available
@@ -641,7 +964,6 @@ def run_bot(config):
             used_set.add(pick)
             batch_proxies.append(pick)
 
-        # Use multitab workers for efficiency
         threads = []
         for i, proxy in enumerate(batch_proxies):
             pos = position + i
@@ -651,7 +973,7 @@ def run_bot(config):
             threads.append(t)
 
         for t in threads:
-            t.join(timeout=600)  # longer timeout for multitab sessions
+            t.join(timeout=600)
 
         position += batch_size
         batch_num += 1
@@ -659,7 +981,6 @@ def run_bot(config):
         if bot_state["views"] >= target:
             break
 
-        # Update ETA based on actual throughput every 2 batches
         if batch_num % 2 == 0 and bot_state["views"] > 0:
             elapsed = time.time() - bot_state["start_time"]
             rate = bot_state["views"] / elapsed
@@ -679,7 +1000,6 @@ def run_bot(config):
 
 
 def _format_duration(seconds):
-    """Format seconds into human-readable duration string."""
     if seconds < 60:
         return f"{seconds}초"
     elif seconds < 3600:
@@ -690,23 +1010,25 @@ def _format_duration(seconds):
         return f"{h}시간 {m}분"
 
 
-def _estimate_eta(target_views, threads, is_direct, proxy_count):
-    """Estimate completion time based on configuration.
-
-    Multitab mode: each Chrome does ~5 views before cycling.
-    - ~60s per view within a session (no driver restart overhead)
-    - ~30s overhead per Chrome startup
-    - ~60% success rate per tab after first
-    """
-    if is_direct:
-        total_sec = int(target_views * 90 / 0.95)
+def _estimate_eta(target_views, threads, is_direct, proxy_count, content_type="video"):
+    if content_type == "shorts":
+        # Shorts: ~10s per view (no min watch time)
+        per_view = 10
+        if is_direct:
+            total_sec = int(target_views * per_view / 0.95)
+        else:
+            effective = min(threads, proxy_count)
+            total_sec = int(target_views * per_view / effective / 0.6)
     else:
-        effective_threads = min(threads, proxy_count)
-        views_per_session = 5
-        session_time = 30 + (views_per_session * 60)  # startup + watch time
-        views_per_session_effective = views_per_session * 0.6  # success rate
-        sessions_needed = target_views / views_per_session_effective
-        total_sec = int(sessions_needed * session_time / effective_threads)
+        if is_direct:
+            total_sec = int(target_views * 90 / 0.95)
+        else:
+            effective_threads = min(threads, proxy_count)
+            views_per_session = 5
+            session_time = 30 + (views_per_session * 60)
+            views_per_session_effective = views_per_session * 0.6
+            sessions_needed = target_views / views_per_session_effective
+            total_sec = int(sessions_needed * session_time / effective_threads)
 
     return _format_duration(total_sec)
 
@@ -738,6 +1060,8 @@ def api_start():
         "proxy_source": data.get("proxy_source", "auto"),
         "custom_proxies": data.get("custom_proxies", ""),
         "playback_speed": float(data.get("playback_speed", 1)),
+        "traffic_source": data.get("traffic_source", "mixed"),
+        "shorts_loops": int(data.get("shorts_loops", 3)),
     }
 
     if not config["url"]:
@@ -788,34 +1112,30 @@ def api_fetch_proxies():
 
 @app.route("/api/validate-url", methods=["POST"])
 def api_validate_url():
-    """Validate YouTube URL and return video metadata (title, thumbnail, duration, views)."""
     data = request.json or {}
     url = data.get("url", "").strip()
 
     if not url:
         return jsonify({"valid": False, "error": "URL을 입력하세요"})
 
-    # Extract video ID
-    import re as _re
-    vid_match = _re.search(r"(?:v=|youtu\.be/|shorts/)([0-9A-Za-z_-]{11})", url)
+    vid_match = re.search(r"(?:v=|youtu\.be/|shorts/)([0-9A-Za-z_-]{11})", url)
     if not vid_match:
         return jsonify({"valid": False, "error": "유효한 YouTube URL이 아닙니다"})
 
     video_id = vid_match.group(1)
+    is_shorts = "/shorts/" in url
 
     try:
-        # Fetch oembed data (no API key needed)
         oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
         resp = requests.get(oembed_url, timeout=10)
         if resp.status_code != 200:
-            return jsonify({"valid": False, "error": "영상을 찾을 수 없습니다 (비공개 또는 삭제됨)"})
+            return jsonify({"valid": False, "error": "영상을 찾을 수 없습니다"})
 
         oembed = resp.json()
         title = oembed.get("title", "Unknown")
         author = oembed.get("author_name", "Unknown")
         thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
 
-        # Try to get additional info from page
         page_resp = requests.get(
             f"https://www.youtube.com/watch?v={video_id}",
             headers={"User-Agent": CHROME_UA, "Accept-Language": "en-US,en;q=0.9"},
@@ -824,10 +1144,10 @@ def api_validate_url():
         view_count = ""
         duration_text = ""
         if page_resp.status_code == 200:
-            vc_match = _re.search(r'"viewCount"\s*:\s*"(\d+)"', page_resp.text)
+            vc_match = re.search(r'"viewCount"\s*:\s*"(\d+)"', page_resp.text)
             if vc_match:
                 view_count = f"{int(vc_match.group(1)):,}"
-            dur_match = _re.search(r'"lengthSeconds"\s*:\s*"(\d+)"', page_resp.text)
+            dur_match = re.search(r'"lengthSeconds"\s*:\s*"(\d+)"', page_resp.text)
             if dur_match:
                 secs = int(dur_match.group(1))
                 duration_text = strftime("%M:%S", gmtime(secs)) if secs < 3600 else strftime("%H:%M:%S", gmtime(secs))
@@ -840,6 +1160,7 @@ def api_validate_url():
             "thumbnail": thumbnail,
             "view_count": view_count,
             "duration": duration_text,
+            "is_shorts": is_shorts,
         })
 
     except Exception as e:
@@ -848,12 +1169,10 @@ def api_validate_url():
 
 @app.route("/api/verify-result", methods=["POST"])
 def api_verify_result():
-    """After bot run, re-fetch video info to check if view count changed."""
     data = request.json or {}
     url = data.get("url", "").strip()
 
-    import re as _re
-    vid_match = _re.search(r"(?:v=|youtu\.be/|shorts/)([0-9A-Za-z_-]{11})", url)
+    vid_match = re.search(r"(?:v=|youtu\.be/|shorts/)([0-9A-Za-z_-]{11})", url)
     if not vid_match:
         return jsonify({"error": "유효한 URL 아님"})
 
@@ -868,7 +1187,7 @@ def api_verify_result():
         view_count = 0
         view_text = ""
         if page_resp.status_code == 200:
-            vc_match = _re.search(r'"viewCount"\s*:\s*"(\d+)"', page_resp.text)
+            vc_match = re.search(r'"viewCount"\s*:\s*"(\d+)"', page_resp.text)
             if vc_match:
                 view_count = int(vc_match.group(1))
                 view_text = f"{view_count:,}"
@@ -888,7 +1207,6 @@ def api_verify_result():
 
 @app.route("/api/logs")
 def api_logs():
-    """Return full logs with filtering support."""
     level = request.args.get("level", "all")
     limit = int(request.args.get("limit", 200))
 
@@ -910,7 +1228,8 @@ def api_logs():
 
 if __name__ == "__main__":
     print("\n" + "=" * 50)
-    print("  YouTube View Web Dashboard")
+    print("  YouTube View Web Dashboard v2")
+    print("  zendriver + fingerprint + traffic diversity")
     print("  http://127.0.0.1:5000")
     print("=" * 50 + "\n")
     app.run(host="127.0.0.1", port=5000, debug=False)
