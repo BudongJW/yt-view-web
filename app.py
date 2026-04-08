@@ -57,7 +57,7 @@ def add_log(msg, level="info"):
         print(f"[{ts}] {msg.encode('ascii', 'replace').decode()}")
 
 
-# ── Proxy Fetcher ──
+# ── Proxy System: ProxyBroker2 + GitHub Lists + Health Scoring ──
 PROXY_SOURCES = {
     "http": [
         "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
@@ -96,10 +96,13 @@ PROXY_SOURCES = {
 
 
 def fetch_free_proxies(proxy_type="http"):
-    sources = PROXY_SOURCES.get(proxy_type, PROXY_SOURCES["http"])
+    """Fetch proxies from GitHub lists + ProxyBroker2 (50+ sources)."""
     proxies = set()
     fetch_lock = threading.Lock()
     source_results = []
+
+    # --- Source 1: GitHub raw lists (fast, parallel) ---
+    sources = PROXY_SOURCES.get(proxy_type, PROXY_SOURCES["http"])
 
     def _fetch_one(url):
         try:
@@ -127,14 +130,46 @@ def fetch_free_proxies(proxy_type="http"):
     for t in threads:
         t.join(timeout=20)
 
+    github_count = len(proxies)
+
+    # --- Source 2: ProxyBroker2 (50+ sources, async) ---
+    pb_count = [0]
+    def _fetch_proxybroker():
+        try:
+            loop = asyncio.new_event_loop()
+            async def _collect():
+                from proxybroker2 import Broker
+                broker_proxies = asyncio.Queue()
+                broker = Broker(broker_proxies)
+                types_map = {"http": ["HTTP", "HTTPS"], "socks4": ["SOCKS4"], "socks5": ["SOCKS5"]}
+                types = types_map.get(proxy_type, ["HTTP", "HTTPS"])
+                # Find up to 500 proxies with 30s timeout
+                await broker.find(types=types, limit=500)
+                while not broker_proxies.empty():
+                    p = broker_proxies.get_nowait()
+                    addr = f"{p.host}:{p.port}"
+                    with fetch_lock:
+                        proxies.add(addr)
+                        pb_count[0] += 1
+            loop.run_until_complete(asyncio.wait_for(_collect(), timeout=45))
+            loop.close()
+        except Exception as e:
+            add_log(f"ProxyBroker2: {str(e)[:60]}", "warn")
+
+    pb_thread = threading.Thread(target=_fetch_proxybroker, daemon=True)
+    pb_thread.start()
+    pb_thread.join(timeout=50)
+
     for src, cnt in sorted(source_results, key=lambda x: -x[1]):
         add_log(f"  {src}: {cnt}개", "info")
-    add_log(f"무료 {proxy_type} 프록시 {len(proxies)}개 수집 완료 ({len(source_results)}/{len(sources)} 소스)")
+    if pb_count[0] > 0:
+        add_log(f"  ProxyBroker2: {pb_count[0]}개", "info")
+    add_log(f"프록시 수집 완료: GitHub {github_count}개 + ProxyBroker2 {pb_count[0]}개 = 총 {len(proxies)}개")
     return list(proxies)
 
 
 def strip_proxy_prefix(proxy):
-    for prefix in ["http://", "https://", "socks5://", "socks4://"]:
+    for prefix in ["http://", "https://", "socks5h://", "socks5://", "socks4://"]:
         if proxy.startswith(prefix):
             return proxy[len(prefix):]
     return proxy
@@ -143,60 +178,198 @@ def strip_proxy_prefix(proxy):
 CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.178 Safari/537.36"
 
 
-def check_proxy_youtube(proxy, proxy_type="http", timeout=8):
-    try:
-        clean = strip_proxy_prefix(proxy)
-        proxy_dict = {
-            "http": f"{proxy_type}://{clean}",
-            "https": f"{proxy_type}://{clean}",
-        }
-        resp = requests.get(
-            "https://www.youtube.com/robots.txt",
-            proxies=proxy_dict, timeout=timeout,
-            headers={"User-Agent": CHROME_UA},
-        )
-        return resp.status_code == 200 and "Disallow" in resp.text
-    except Exception:
-        return False
+# ── Proxy Health Scoring System ──
+class ProxyHealthTracker:
+    """Track per-proxy success rate and manage smart selection."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # {proxy_addr: {"success": int, "fail": int, "captcha": int,
+        #               "last_used": float, "score": float, "country": str}}
+        self._stats = {}
+        self._blacklist = {}  # {proxy_addr: blacklist_until_timestamp}
+        self._rate_limit = {}  # {proxy_addr: [timestamp, timestamp, ...]}
+
+    def record_success(self, proxy):
+        with self._lock:
+            p = strip_proxy_prefix(proxy)
+            s = self._stats.setdefault(p, {"success": 0, "fail": 0, "captcha": 0, "score": 0.5})
+            s["success"] += 1
+            s["last_used"] = time.time()
+            s["score"] = self._calc_score(s)
+
+    def record_fail(self, proxy, is_captcha=False):
+        with self._lock:
+            p = strip_proxy_prefix(proxy)
+            s = self._stats.setdefault(p, {"success": 0, "fail": 0, "captcha": 0, "score": 0.5})
+            s["fail"] += 1
+            if is_captcha:
+                s["captcha"] += 1
+                # CAPTCHA = blacklist for 30 minutes
+                self._blacklist[p] = time.time() + 1800
+            s["last_used"] = time.time()
+            s["score"] = self._calc_score(s)
+
+    def _calc_score(self, s):
+        """Composite health score: success_rate * 0.5 + captcha_free * 0.3 + recency * 0.2"""
+        total = s["success"] + s["fail"]
+        if total == 0:
+            return 0.5  # unknown = neutral
+        success_rate = s["success"] / total
+        captcha_free = 1.0 - (s["captcha"] / total)
+        return success_rate * 0.5 + captcha_free * 0.3 + 0.2  # recency bonus for active proxies
+
+    def is_available(self, proxy):
+        """Check if proxy is not blacklisted and within rate limit."""
+        with self._lock:
+            p = strip_proxy_prefix(proxy)
+            # Check blacklist
+            bl_until = self._blacklist.get(p, 0)
+            if time.time() < bl_until:
+                return False
+            # Check rate limit: max 2 uses per 10 minutes
+            timestamps = self._rate_limit.get(p, [])
+            cutoff = time.time() - 600
+            recent = [t for t in timestamps if t > cutoff]
+            return len(recent) < 2
+
+    def mark_used(self, proxy):
+        """Record usage for rate limiting."""
+        with self._lock:
+            p = strip_proxy_prefix(proxy)
+            self._rate_limit.setdefault(p, []).append(time.time())
+            # Trim old entries
+            cutoff = time.time() - 600
+            self._rate_limit[p] = [t for t in self._rate_limit[p] if t > cutoff]
+
+    def select_best(self, proxy_list, count=1):
+        """Select best proxies using weighted random based on health score."""
+        with self._lock:
+            now = time.time()
+            candidates = []
+            for p in proxy_list:
+                addr = strip_proxy_prefix(p)
+                # Skip blacklisted
+                if now < self._blacklist.get(addr, 0):
+                    continue
+                # Skip rate-limited
+                timestamps = self._rate_limit.get(addr, [])
+                recent = [t for t in timestamps if t > now - 600]
+                if len(recent) >= 2:
+                    continue
+                score = self._stats.get(addr, {}).get("score", 0.5)
+                candidates.append((p, score))
+
+            if not candidates:
+                return proxy_list[:count]  # fallback
+
+            # Weighted random selection (score^2 to strongly favor good proxies)
+            weights = [s ** 2 for _, s in candidates]
+            total_w = sum(weights)
+            if total_w == 0:
+                return [c[0] for c in candidates[:count]]
+
+            selected = []
+            remaining = list(zip([c[0] for c in candidates], weights))
+            for _ in range(min(count, len(remaining))):
+                r = random() * sum(w for _, w in remaining)
+                cumulative = 0
+                for i, (proxy, w) in enumerate(remaining):
+                    cumulative += w
+                    if cumulative >= r:
+                        selected.append(proxy)
+                        remaining.pop(i)
+                        break
+            return selected
+
+    def get_stats_summary(self):
+        """Return summary for API endpoint."""
+        with self._lock:
+            total = len(self._stats)
+            if total == 0:
+                return {"tracked": 0, "avg_score": 0, "blacklisted": 0}
+            scores = [s["score"] for s in self._stats.values()]
+            bl_count = sum(1 for t in self._blacklist.values() if time.time() < t)
+            return {
+                "tracked": total,
+                "avg_score": round(sum(scores) / len(scores), 3),
+                "blacklisted": bl_count,
+                "top_score": round(max(scores), 3),
+            }
 
 
-_bad_proxy_set = set()
-_bad_proxy_lock = threading.Lock()
+# Global health tracker
+proxy_health = ProxyHealthTracker()
 
 
-def mark_bad_proxy(proxy):
-    with _bad_proxy_lock:
-        _bad_proxy_set.add(strip_proxy_prefix(proxy))
+def mark_bad_proxy(proxy, is_captcha=False):
+    proxy_health.record_fail(proxy, is_captcha)
 
 
 def is_bad_proxy(proxy):
-    with _bad_proxy_lock:
-        return strip_proxy_prefix(proxy) in _bad_proxy_set
+    return not proxy_health.is_available(proxy)
+
+
+def _warm_proxy(proxy, proxy_type="http", timeout=8):
+    """3-stage proxy warmup: httpbin → Google → YouTube robots.txt.
+    Returns (success: bool, latency_ms: float)."""
+    clean = strip_proxy_prefix(proxy)
+    proxy_url = f"socks5h://{clean}" if proxy_type == "socks5" else f"{proxy_type}://{clean}"
+    proxy_dict = {"http": proxy_url, "https": proxy_url}
+    headers = {"User-Agent": CHROME_UA}
+    start = time.time()
+
+    try:
+        # Stage 1: Basic connectivity
+        r1 = requests.get("http://httpbin.org/ip", proxies=proxy_dict, timeout=timeout, headers=headers)
+        if r1.status_code != 200:
+            return False, 0
+
+        # Stage 2: Google (check for instant CAPTCHA)
+        r2 = requests.get("https://www.google.com/", proxies=proxy_dict, timeout=timeout, headers=headers)
+        if "/sorry/" in r2.url or r2.status_code != 200:
+            return False, 0  # Google already blocking this IP
+
+        # Stage 3: YouTube robots.txt
+        r3 = requests.get("https://www.youtube.com/robots.txt", proxies=proxy_dict, timeout=timeout, headers=headers)
+        if r3.status_code != 200 or "Disallow" not in r3.text:
+            return False, 0
+
+        latency = (time.time() - start) * 1000
+        return True, latency
+
+    except Exception:
+        return False, 0
 
 
 def pre_validate_proxies(proxy_list, proxy_type="http", max_workers=150, target=30):
+    """3-stage warmup validation with health scoring."""
     import random as _rand
     final_valid = []
     lock = threading.Lock()
     done_event = threading.Event()
 
-    needed_samples = min(len(proxy_list), max(target * 150, 3000))
+    needed_samples = min(len(proxy_list), max(target * 100, 3000))
     sample_list = _rand.sample(proxy_list, needed_samples)
 
     add_log(f"프록시 검증 시작 (후보 {len(proxy_list)}개, 테스트 {len(sample_list)}개, 목표 {target}개)...")
-    add_log(f"YouTube 직접 검증 (동시 {max_workers} 스레드)...")
+    add_log(f"3단계 워밍업: httpbin → Google → YouTube (동시 {max_workers} 스레드)...")
 
     tested = [0]
 
-    def _yt_check(proxy):
+    def _warmup_check(proxy):
         if done_event.is_set() or cancel_flag.is_set():
             return
-        if check_proxy_youtube(proxy, proxy_type, 12):
+        success, latency = _warm_proxy(proxy, proxy_type, 12)
+        if success:
+            proxy_health.record_success(proxy)
             with lock:
                 final_valid.append(proxy)
-                add_log(f"  YouTube OK: {strip_proxy_prefix(proxy)} [{len(final_valid)}/{target}]", "success")
+                add_log(f"  Warm OK: {strip_proxy_prefix(proxy)} [{len(final_valid)}/{target}] {latency:.0f}ms", "success")
                 if len(final_valid) >= target:
                     done_event.set()
+        else:
+            proxy_health.record_fail(proxy)
         with lock:
             tested[0] += 1
             if tested[0] % 500 == 0:
@@ -206,13 +379,13 @@ def pre_validate_proxies(proxy_list, proxy_type="http", max_workers=150, target=
     for p in sample_list:
         if done_event.is_set() or cancel_flag.is_set():
             break
-        t = threading.Thread(target=_yt_check, args=(p,), daemon=True)
+        t = threading.Thread(target=_warmup_check, args=(p,), daemon=True)
         threads_list.append(t)
         t.start()
         while sum(1 for t in threads_list if t.is_alive()) >= max_workers:
             sleep(0.01)
 
-    deadline = time.time() + 180
+    deadline = time.time() + 240  # 4min for 3-stage warmup
     for t in threads_list:
         if done_event.is_set():
             break
@@ -221,8 +394,10 @@ def pre_validate_proxies(proxy_list, proxy_type="http", max_workers=150, target=
         if time.time() >= deadline:
             break
 
+    stats = proxy_health.get_stats_summary()
     add_log(
-        f"검증 완료: {len(final_valid)}개 YouTube 유효 프록시 (테스트 {tested[0]}/{len(sample_list)})",
+        f"검증 완료: {len(final_valid)}개 유효 (테스트 {tested[0]}/{len(sample_list)}) | "
+        f"평균 점수: {stats['avg_score']} | 블랙리스트: {stats['blacklisted']}",
         "success" if final_valid else "error",
     )
     return final_valid
@@ -574,7 +749,10 @@ async def _try_load_video_async(page, browser, config, position, proxy_label):
             await page.sleep(2)
 
     cur_url = page.url or ""
-    if "supported_browsers" in cur_url:
+    if "/sorry/" in cur_url or "google.com/sorry" in cur_url:
+        add_log(f"Worker {position} | {proxy_label} | Google CAPTCHA detected - blacklisting proxy", "warn")
+        bot_state["_last_captcha"] = True
+    elif "supported_browsers" in cur_url:
         add_log(f"Worker {position} | {proxy_label} | YouTube blocked (unsupported browser)", "warn")
     else:
         add_log(f"Worker {position} | {proxy_label} | Load failed | url={cur_url[:80]}", "warn")
@@ -785,7 +963,9 @@ async def _worker_multitab_async(position, proxy, proxy_type, config):
             page = await _try_load_video_async(page, browser, config, position, proxy_label)
             if not page:
                 if not is_direct:
-                    mark_bad_proxy(proxy)
+                    # Check if failure was due to Google CAPTCHA
+                    mark_bad_proxy(proxy, is_captcha=bot_state.get("_last_captcha", False))
+                    bot_state.pop("_last_captcha", None)
                     bot_state["bad_proxies"] += 1
                 raise Exception("Video load failed")
 
@@ -832,6 +1012,8 @@ async def _worker_multitab_async(position, proxy, proxy_type, config):
                 except Exception as e:
                     add_log(f"Worker {position} | Tab {tab_i+1} error: {str(e)[:80]}", "warn")
 
+            if not is_direct:
+                proxy_health.record_success(proxy)
             add_log(f"Worker {position} | Session done: {session_views} views from {proxy_label}", "success")
             return
 
@@ -954,15 +1136,10 @@ def run_bot(config):
         if batch_size <= 0:
             break
 
-        batch_proxies = []
-        used_set = set()
-        for _ in range(batch_size):
-            candidates = [p for p in available if p not in used_set]
-            if not candidates:
-                candidates = available
-            pick = choice(candidates)
-            used_set.add(pick)
-            batch_proxies.append(pick)
+        # Use health-based smart selection
+        batch_proxies = proxy_health.select_best(available, batch_size)
+        for p in batch_proxies:
+            proxy_health.mark_used(p)
 
         threads = []
         for i, proxy in enumerate(batch_proxies):
@@ -1099,6 +1276,7 @@ def api_status():
         "logs": bot_state["logs"][:100],
         "video_stats": bot_state["video_stats"],
         "workers": bot_state["workers"],
+        "proxy_health": proxy_health.get_stats_summary(),
     })
 
 

@@ -3,3 +3,4 @@ requests>=2.28
 zendriver>=0.15
 psutil>=5.9
 PySocks>=1.7
+proxybroker2>=2.0
