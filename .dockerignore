@@ -1,0 +1,7 @@
+__pycache__
+*.pyc
+.git
+.gitignore
+chrome-extension
+proxies
+*.md

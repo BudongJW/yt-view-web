@@ -563,7 +563,12 @@ async def start_browser(headless=True, proxy=None, proxy_type="http", is_shorts=
     if proxy:
         args.append(f"--proxy-server={proxy_type}://{proxy}")
 
-    browser = await uc.start(headless=headless, browser_args=args)
+    kwargs = {"headless": headless, "browser_args": args}
+    # Docker/Linux: use CHROME_PATH env if set
+    chrome_path = os.environ.get("CHROME_PATH")
+    if chrome_path and os.path.exists(chrome_path):
+        kwargs["browser_executable_path"] = chrome_path
+    browser = await uc.start(**kwargs)
     return browser
 
 
@@ -1408,6 +1413,8 @@ if __name__ == "__main__":
     print("\n" + "=" * 50)
     print("  YouTube View Web Dashboard v2")
     print("  zendriver + fingerprint + traffic diversity")
-    print("  http://127.0.0.1:5000")
+    print(f"  http://{os.environ.get('HOST', '0.0.0.0')}:{os.environ.get('PORT', '5000')}")
     print("=" * 50 + "\n")
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host=host, port=port, debug=False)
