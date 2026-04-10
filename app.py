@@ -137,13 +137,13 @@ def fetch_free_proxies(proxy_type="http"):
     def _fetch_proxybroker():
         try:
             loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             async def _collect():
                 from proxybroker2 import Broker
                 broker_proxies = asyncio.Queue()
                 broker = Broker(broker_proxies)
                 types_map = {"http": ["HTTP", "HTTPS"], "socks4": ["SOCKS4"], "socks5": ["SOCKS5"]}
                 types = types_map.get(proxy_type, ["HTTP", "HTTPS"])
-                # Find up to 500 proxies with 30s timeout
                 await broker.find(types=types, limit=500)
                 while not broker_proxies.empty():
                     p = broker_proxies.get_nowait()
@@ -558,6 +558,8 @@ async def start_browser(headless=True, proxy=None, proxy_type="http", is_shorts=
         "--disable-webrtc-hw-encoding",
         "--disable-webrtc-hw-decoding",
         "--enforce-webrtc-ip-permission-check",
+        "--single-process",
+        "--disable-software-rasterizer",
         f"--user-agent={ua}",
     ]
     if proxy:
@@ -1033,7 +1035,7 @@ async def _worker_multitab_async(position, proxy, proxy_type, config):
             bot_state["workers"].pop(position, None)
             if browser:
                 try:
-                    browser.stop()
+                    await browser.stop()
                 except Exception:
                     pass
 
@@ -1060,8 +1062,9 @@ def run_bot(config):
     bot_state["start_time"] = time.time()
     bot_state["target_views"] = config.get("target_views", 100)
 
-    with _bad_proxy_lock:
-        _bad_proxy_set.clear()
+    # Reset health tracker for new session
+    global proxy_health
+    proxy_health = ProxyHealthTracker()
 
     # Detect content type
     content_type = _detect_content_type(config["url"])
@@ -1088,9 +1091,9 @@ def run_bot(config):
         proxy_list = pre_validate_proxies(raw_proxies, proxy_type, max_workers=150, target=target_valid)
 
     if not proxy_list:
-        add_log("유효한 프록시가 없습니다!", "error")
-        bot_state["running"] = False
-        return
+        add_log("유효한 프록시 없음 - 직접 연결 모드로 전환", "warn")
+        proxy_list = ["__direct__"]
+        use_no_proxy = True
 
     config["_proxy_pool"] = proxy_list
     config["_max_retries"] = 3
@@ -1104,7 +1107,7 @@ def run_bot(config):
     target = config.get("target_views", 100)
     max_threads = config.get("threads", 5)
     if use_no_proxy:
-        max_threads = 1
+        max_threads = min(max_threads, 2)  # direct mode: max 2 concurrent to avoid detection
 
     traffic_src = config.get("traffic_source", "mixed")
     bot_state["eta"] = _estimate_eta(target, max_threads, use_no_proxy, len(proxy_list), content_type)
